@@ -1,0 +1,13 @@
+einops
+matplotlib
+numpy
+Pillow
+opencv_python
+scipy
+scikit-image
+tqdm
+transformers
+yapf
+gpustat
+calflops
+deepspeed==0.18.8
