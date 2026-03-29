@@ -533,11 +533,20 @@ def train_vqgan_model_deepspeed(train_loader, generator_model,
 
         # for generator training
         ########################################################################################
-        reconstruction_images, codebook_usage, codebook_loss_dict = generator_model(
-            images)
-        loss_dict = criterion(images,
-                              reconstruction_images,
-                              loss_type='generator_loss')
+        if config.use_amp:
+            with autocast(device_type="cuda", dtype=config.amp_type):
+                reconstruction_images, codebook_usage, codebook_loss_dict = generator_model(
+                    images)
+                loss_dict = criterion(images,
+                                      reconstruction_images,
+                                      loss_type='generator_loss')
+
+        else:
+            reconstruction_images, codebook_usage, codebook_loss_dict = generator_model(
+                images)
+            loss_dict = criterion(images,
+                                  reconstruction_images,
+                                  loss_type='generator_loss')
 
         generator_loss_dict = {}
         generator_loss_dict["vq_loss"] = codebook_loss_dict["vq_loss"]
@@ -579,9 +588,16 @@ def train_vqgan_model_deepspeed(train_loader, generator_model,
 
         ########################################################################################
         # for discriminator training
-        loss_dict = criterion(images,
-                              reconstruction_images,
-                              loss_type='discriminator_loss')
+        if config.use_amp:
+            with autocast(device_type="cuda", dtype=config.amp_type):
+                loss_dict = criterion(images,
+                                      reconstruction_images,
+                                      loss_type='discriminator_loss')
+
+        else:
+            loss_dict = criterion(images,
+                                  reconstruction_images,
+                                  loss_type='discriminator_loss')
 
         discriminator_loss_dict = {}
         discriminator_real = 0.
@@ -710,12 +726,11 @@ def train_vqgan_model_deepspeed(train_loader, generator_model,
                     config.checkpoint_dir,
                     f'step_{total_accumulation_iters}_discriminator_model.pth')
 
-                if hasattr(config, 'deepspeed_zero_stage'
-                           ) and config.deepspeed_zero_stage == 3:
+                # Generator: respect ZeRO stage for parameter gathering
+                if config.deepspeed_zero_stage == 3:
                     generator_state_dict = {}
                     for name, param in generator_module.named_parameters():
-                        with deepspeed.zero.GatheredParameters(
-                                param, modifier_rank=0):
+                        with deepspeed.zero.GatheredParameters(param):
                             if local_rank == 0 and total_rank == 0:
                                 generator_state_dict[name] = param.data.cpu(
                                 ).clone()
@@ -724,26 +739,15 @@ def train_vqgan_model_deepspeed(train_loader, generator_model,
                             generator_state_dict[name] = buf.cpu().clone()
                     if local_rank == 0 and total_rank == 0:
                         torch.save(generator_state_dict, generator_save_path)
-
-                    discriminator_state_dict = {}
-                    for name, param in discriminator_module.named_parameters():
-                        with deepspeed.zero.GatheredParameters(
-                                param, modifier_rank=0):
-                            if local_rank == 0 and total_rank == 0:
-                                discriminator_state_dict[
-                                    name] = param.data.cpu().clone()
-                    for name, buf in discriminator_module.named_buffers():
-                        if local_rank == 0 and total_rank == 0:
-                            discriminator_state_dict[name] = buf.cpu().clone()
-                    if local_rank == 0 and total_rank == 0:
-                        torch.save(discriminator_state_dict,
-                                   discriminator_save_path)
                 else:
                     if local_rank == 0 and total_rank == 0:
                         torch.save(generator_module.state_dict(),
                                    generator_save_path)
-                        torch.save(discriminator_module.state_dict(),
-                                   discriminator_save_path)
+
+                # Discriminator: always ZeRO Stage 0, no parameter partitioning
+                if local_rank == 0 and total_rank == 0:
+                    torch.save(discriminator_module.state_dict(),
+                               discriminator_save_path)
 
         iter_index += 1
 
@@ -1166,12 +1170,10 @@ def train_fsq_model_deepspeed(train_loader, model, criterion, optimizer,
                     config.checkpoint_dir,
                     f'step_{total_accumulation_iters}.pth')
 
-                if hasattr(config, 'deepspeed_zero_stage'
-                           ) and config.deepspeed_zero_stage == 3:
+                if config.deepspeed_zero_stage == 3:
                     state_dict = {}
                     for name, param in module.named_parameters():
-                        with deepspeed.zero.GatheredParameters(
-                                param, modifier_rank=0):
+                        with deepspeed.zero.GatheredParameters(param):
                             if local_rank == 0 and total_rank == 0:
                                 state_dict[name] = param.data.cpu().clone()
                     for name, buf in module.named_buffers():

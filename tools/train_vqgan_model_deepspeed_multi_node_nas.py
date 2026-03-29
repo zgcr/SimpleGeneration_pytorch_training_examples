@@ -50,18 +50,6 @@ def build_param_groups(config, model, model_type):
     # split internally (>=2D params use Muon, others use AdamW fallback).
     # We only need to pass all trainable parameters and build logging info.
     if optimizer_name == 'Muon':
-        exclude_muon_layer_name_list = [
-            'position_encoding',
-            'cls_token',
-            'patch_embedding',
-        ]
-        if 'exclude_muon_layer_name_list' in optimizer_parameters.keys(
-        ) and isinstance(optimizer_parameters['exclude_muon_layer_name_list'],
-                         list):
-            exclude_muon_layer_name_list = (
-                exclude_muon_layer_name_list +
-                optimizer_parameters['exclude_muon_layer_name_list'])
-
         muon_param_names = []
         adamw_param_names = []
         all_params = []
@@ -69,12 +57,10 @@ def build_param_groups(config, model, model_type):
             if not param.requires_grad:
                 continue
             all_params.append(param)
-            use_muon = (
-                param.ndim >= 2
-                and not any(exclude_name in name
-                            for exclude_name in exclude_muon_layer_name_list))
-            param.use_muon = use_muon
-            if use_muon:
+            # DeepSpeed native Muon uses param.ndim >= 2 internally
+            # to decide Muon vs AdamW fallback, mirror that logic here
+            # for accurate logging.
+            if param.ndim >= 2:
                 muon_param_names.append(name)
             else:
                 adamw_param_names.append(name)

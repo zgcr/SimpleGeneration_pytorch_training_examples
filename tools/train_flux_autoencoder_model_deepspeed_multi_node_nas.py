@@ -13,16 +13,23 @@ import time
 import math
 
 import torch
+import deepspeed
 from torch.utils.data import DataLoader
 
-from tools.autoencoder_scripts import train_flux_autoencoder_model
-from tools.utils import (get_logger, set_seed, worker_seed_init_fn,
-                         build_training_mode)
+from tools.autoencoder_scripts import train_flux_autoencoder_model_deepspeed
+from tools.utils import (set_seed, get_logger, worker_seed_init_fn)
 
-from tools.muon_optimizer import Muon
+# NLayerDiscriminator is very small (~2.77M params, ~44 MB total memory
+# per GPU including optimizer states). ZeRO partitioning brings negligible
+# memory savings but adds communication overhead.  Fix it at Stage 0 (DDP).
+DISCRIMINATOR_ZERO_STAGE = 0
 
 
-def build_optimizer(config, model, model_type):
+def build_param_groups(config, model, model_type):
+    """Build parameter groups for optimizer (weight decay differentiation).
+    Returns (model_params_weight_decay_list, model_layer_weight_decay_list).
+    Does NOT create the optimizer — DeepSpeed will create it from ds_config.
+    """
     assert model_type in [
         'generator_model',
         'discriminator_model',
@@ -39,11 +46,49 @@ def build_optimizer(config, model, model_type):
     lr = optimizer_parameters['lr']
     weight_decay = optimizer_parameters['weight_decay']
 
-    # if global_weight_decay = False,set 1d parms weight decay = 0.
+    # For Muon, DeepSpeed native implementation handles muon/adamw param
+    # split internally (>=2D params use Muon, others use AdamW fallback).
+    # We only need to pass all trainable parameters and build logging info.
+    if optimizer_name == 'Muon':
+        muon_param_names = []
+        adamw_param_names = []
+        all_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            all_params.append(param)
+            # DeepSpeed native Muon uses param.ndim >= 2 internally
+            # to decide Muon vs AdamW fallback, mirror that logic here
+            # for accurate logging.
+            if param.ndim >= 2:
+                muon_param_names.append(name)
+            else:
+                adamw_param_names.append(name)
+
+        model_params_weight_decay_list = all_params
+
+        model_layer_weight_decay_list = []
+        if muon_param_names:
+            model_layer_weight_decay_list.append({
+                'name': muon_param_names,
+                'optimizer': 'Muon',
+                'lr': lr,
+                'weight_decay': weight_decay,
+            })
+        if adamw_param_names:
+            model_layer_weight_decay_list.append({
+                'name': adamw_param_names,
+                'optimizer': 'AdamW',
+                'lr': lr,
+                'weight_decay': weight_decay,
+            })
+
+        return model_params_weight_decay_list, model_layer_weight_decay_list
+
+    # For SGD/AdamW, handle per-layer weight decay and lr differentiation.
     global_weight_decay = True if 'global_weight_decay' not in optimizer_parameters.keys(
     ) else optimizer_parameters['global_weight_decay']
 
-    # if global_weight_decay = True,no_weight_decay_layer_name_list can't be set.
     no_weight_decay_layer_name_list = []
     if 'no_weight_decay_layer_name_list' in optimizer_parameters.keys(
     ) and isinstance(optimizer_parameters['no_weight_decay_layer_name_list'],
@@ -321,15 +366,122 @@ def build_optimizer(config, model, model_type):
         assert len(model_params_weight_decay_list) == len(
             model_layer_weight_decay_list)
 
+    return model_params_weight_decay_list, model_layer_weight_decay_list
+
+
+def build_deepspeed_config(config, model_type):
+    """Build DeepSpeed config dict from training config for generator or discriminator."""
+    assert model_type in [
+        'generator_model',
+        'discriminator_model',
+    ]
+    if model_type == 'generator_model':
+        optimizer_name = config.generator_optimizer[0]
+        optimizer_parameters = config.generator_optimizer[1]
+        zero_stage = config.deepspeed_zero_stage
+    elif model_type == 'discriminator_model':
+        optimizer_name = config.discriminator_optimizer[0]
+        optimizer_parameters = config.discriminator_optimizer[1]
+        # NLayerDiscriminator is very small, always use ZeRO Stage 0
+        zero_stage = DISCRIMINATOR_ZERO_STAGE
+
+    ds_config = {
+        "train_micro_batch_size_per_gpu": config.batch_size // config.gpus_num,
+        "gradient_accumulation_steps": config.accumulation_steps,
+        # never print by deepspeed
+        "steps_per_print": 2**31,
+        "wall_clock_breakdown": False,
+        "zero_optimization": {
+            "stage": zero_stage,
+        },
+    }
+
+    # Gradient clipping
+    if model_type == 'generator_model':
+        if hasattr(config, 'generator_clip_max_norm'
+                   ) and config.generator_clip_max_norm > 0:
+            ds_config["gradient_clipping"] = config.generator_clip_max_norm
+        else:
+            ds_config["gradient_clipping"] = 0.0
+    elif model_type == 'discriminator_model':
+        if hasattr(config, 'discriminator_clip_max_norm'
+                   ) and config.discriminator_clip_max_norm > 0:
+            ds_config["gradient_clipping"] = config.discriminator_clip_max_norm
+        else:
+            ds_config["gradient_clipping"] = 0.0
+
+    # Mixed precision
+    if config.use_amp:
+        if config.amp_type == torch.float16:
+            ds_config["fp16"] = {
+                "enabled": True,
+                # 0代表启用dynamic loss scaling
+                "loss_scale": 0,
+                # dynamic loss scaling的初始值为65536,2的16次方
+                "initial_scale_power": 16,
+                # 连续1000个step没有出现overflow的情况下loss scale会翻倍(尝试更激进的缩放以获得更好的梯度精度),1000是DeepSpeed默认值
+                "loss_scale_window": 1000,
+                # 连续发生2次overflow之后才真正将loss scale减半
+                "hysteresis": 2,
+                # loss scale下限为1
+                "min_loss_scale": 1,
+            }
+            ds_config["torch_autocast"] = {
+                "enabled": True,
+                "dtype": "float16",
+            }
+        elif config.amp_type == torch.bfloat16:
+            ds_config["bf16"] = {
+                "enabled": True,
+            }
+            ds_config["torch_autocast"] = {
+                "enabled": True,
+                "dtype": "bfloat16",
+            }
+    else:
+        ds_config["fp16"] = {"enabled": False}
+        ds_config["bf16"] = {"enabled": False}
+
+    # ZeRO-Offload
+    if hasattr(config, 'deepspeed_offload') and config.deepspeed_offload:
+        if zero_stage >= 2:
+            # 将优化器状态(如Adam的一阶矩m和二阶矩v)卸载到CPU内存,仅在ZeRO Stage≥2时有意义
+            ds_config["zero_optimization"]["offload_optimizer"] = {
+                "device": "cpu",
+                "pin_memory": True,
+            }
+        if zero_stage == 3:
+            # 将模型参数本身卸载到CPU内存,仅在ZeRO Stage=3时可用
+            ds_config["zero_optimization"]["offload_param"] = {
+                "device": "cpu",
+                "pin_memory": True,
+            }
+
+    # ZeRO Stage 3 specific
+    if zero_stage == 3:
+        # ZeRO-3下每个rank只持有1/N参数分片,直接state_dict()只能拿到本rank的模型分片参数。开启此选项后,调用model_engine.save_checkpoint()时DeepSpeed 会自动执行all-gather将完整的16-bit权重收集到一起保存
+        ds_config["zero_optimization"][
+            "stage3_gather_16bit_weights_on_model_save"] = True
+
+    # Optimizer (let DeepSpeed create the optimizer natively for ZeRO
+    # compatibility, especially for Muon which requires native support
+    # under ZeRO stage 1/2/3).
+    assert optimizer_name in ['SGD', 'AdamW', 'Muon'], 'Unsupported optimizer!'
+
     if optimizer_name == 'SGD':
-        momentum = optimizer_parameters['momentum']
+        momentum = 0.9 if 'momentum' not in optimizer_parameters.keys(
+        ) else optimizer_parameters['momentum']
         nesterov = False if 'nesterov' not in optimizer_parameters.keys(
         ) else optimizer_parameters['nesterov']
-        return torch.optim.SGD(
-            model_params_weight_decay_list,
-            lr=lr,
-            momentum=momentum,
-            nesterov=nesterov), model_layer_weight_decay_list
+        ds_config["optimizer"] = {
+            "type": "SGD",
+            "params": {
+                "lr": optimizer_parameters['lr'],
+                "momentum": momentum,
+                "nesterov": nesterov,
+                "weight_decay": optimizer_parameters['weight_decay'],
+            }
+        }
     elif optimizer_name == 'AdamW':
         beta1 = 0.9 if 'beta1' not in optimizer_parameters.keys(
         ) else optimizer_parameters['beta1']
@@ -337,89 +489,67 @@ def build_optimizer(config, model, model_type):
         ) else optimizer_parameters['beta2']
         eps = 1e-08 if 'eps' not in optimizer_parameters.keys(
         ) else optimizer_parameters['eps']
-        return torch.optim.AdamW(model_params_weight_decay_list,
-                                 lr=lr,
-                                 betas=(beta1, beta2),
-                                 eps=eps), model_layer_weight_decay_list
+        ds_config["optimizer"] = {
+            "type": "AdamW",
+            "params": {
+                "lr": optimizer_parameters['lr'],
+                "betas": [beta1, beta2],
+                "eps": eps,
+                "weight_decay": optimizer_parameters['weight_decay'],
+            }
+        }
     elif optimizer_name == 'Muon':
-        # Note: Muon uses unified lr and wd for all parameters.
-        # Per-layer lr/wd settings from optimizer_parameters are not applied.
-        # Muon optimizer don't support global_weight_decay
-        # Muon optimizer don't support no_weight_decay_layer_name_list
-        # Muon optimizer don't support sub_layer_lr/sub_layer_weight_decay
-        # Muon optimizer don't support lr_layer_decay
-
-        exclude_muon_layer_name_list = [
-            'position_encoding',
-            'cls_token',
-            'patch_embedding',
-        ]
-        if 'exclude_muon_layer_name_list' in optimizer_parameters.keys(
-        ) and isinstance(optimizer_parameters['exclude_muon_layer_name_list'],
-                         list):
-            exclude_muon_layer_name_list = exclude_muon_layer_name_list + optimizer_parameters[
-                'exclude_muon_layer_name_list']
-
-        # Separate parameters into muon_params and adamw_params
-        muon_param_list, muon_param_names = [], []
-        adamw_param_list, adamw_param_names = [], []
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-
-            # Muon is used for 2D parameters that are not in exclude list
-            use_muon = (
-                param.ndim >= 2
-                and not any(exclude_name in name
-                            for exclude_name in exclude_muon_layer_name_list))
-
-            if use_muon:
-                muon_param_list.append(param)
-                muon_param_names.append(name)
-            else:
-                adamw_param_list.append(param)
-                adamw_param_names.append(name)
-
-        # Create summary for model_layer_weight_decay_list
-        model_layer_weight_decay_list = []
-        if len(muon_param_names) > 0:
-            model_layer_weight_decay_list.append({
-                'name': muon_param_names,
-                'optimizer': 'Muon',
-                'lr': lr,
-                'weight_decay': weight_decay,
-            })
-        if len(adamw_param_names) > 0:
-            model_layer_weight_decay_list.append({
-                'name': adamw_param_names,
-                'optimizer': 'AdamW',
-                'lr': lr,
-                'weight_decay': weight_decay,
-            })
-
         momentum = 0.95 if 'momentum' not in optimizer_parameters.keys(
         ) else optimizer_parameters['momentum']
         nesterov = True if 'nesterov' not in optimizer_parameters.keys(
         ) else optimizer_parameters['nesterov']
         ns_steps = 5 if 'ns_steps' not in optimizer_parameters.keys(
         ) else optimizer_parameters['ns_steps']
-
         adamw_beta1 = 0.9 if 'adamw_beta1' not in optimizer_parameters.keys(
         ) else optimizer_parameters['adamw_beta1']
         adamw_beta2 = 0.999 if 'adamw_beta2' not in optimizer_parameters.keys(
         ) else optimizer_parameters['adamw_beta2']
         adamw_eps = 1e-08 if 'adamw_eps' not in optimizer_parameters.keys(
         ) else optimizer_parameters['adamw_eps']
+        ds_config["optimizer"] = {
+            "type": "Muon",
+            "params": {
+                "lr": optimizer_parameters['lr'],
+                "wd": optimizer_parameters['weight_decay'],
+                "momentum": momentum,
+                "nesterov": nesterov,
+                "ns_steps": ns_steps,
+                "adamw_betas": [adamw_beta1, adamw_beta2],
+                "adamw_eps": adamw_eps,
+            }
+        }
 
-        return Muon(lr=lr,
-                    wd=weight_decay,
-                    muon_params=muon_param_list,
-                    adamw_params=adamw_param_list,
-                    momentum=momentum,
-                    nesterov=nesterov,
-                    ns_steps=ns_steps,
-                    adamw_betas=(adamw_beta1, adamw_beta2),
-                    adamw_eps=adamw_eps), model_layer_weight_decay_list
+    return ds_config
+
+
+def get_model_state_dict(model_engine, config, zero_stage):
+    """
+    Get full model state dict for saving.
+    For ZeRO-3, all ranks must call this function (GatheredParameters is
+    collective), but only rank 0 returns a non-None dict.
+    """
+    if config.use_compile:
+        module = model_engine.module._orig_mod
+    else:
+        module = model_engine.module
+
+    if zero_stage == 3:
+        state_dict = {}
+        for name, param in module.named_parameters():
+            with deepspeed.zero.GatheredParameters(param):
+                if config.total_rank == 0 and config.local_rank == 0:
+                    state_dict[name] = param.data.cpu().clone()
+        for name, buf in module.named_buffers():
+            if config.total_rank == 0 and config.local_rank == 0:
+                state_dict[name] = buf.cpu().clone()
+        return state_dict if config.total_rank == 0 and config.local_rank == 0 else None
+    else:
+        return module.state_dict()
 
 
 class Scheduler:
@@ -522,13 +652,15 @@ class Scheduler:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='PyTorch VQGAN Training')
+    parser = argparse.ArgumentParser(
+        description='PyTorch Flux AutoEncoder Training')
     parser.add_argument(
         '--work-dir',
         type=str,
         help='path for get training config and saving log/models')
+    args, _ = parser.parse_known_args()
 
-    return parser.parse_args()
+    return args
 
 
 def main():
@@ -540,10 +672,26 @@ def main():
     from train_config import config
     log_dir = os.path.join(args.work_dir, 'log')
     checkpoint_dir = os.path.join(args.work_dir, 'checkpoints')
-    resume_model = os.path.join(checkpoint_dir, 'latest.pth')
     config.checkpoint_dir = checkpoint_dir
     config.gpus_type = torch.cuda.get_device_name()
     config.gpus_num = torch.cuda.device_count()
+
+    generator_checkpoint_dir = os.path.join(checkpoint_dir, 'generator')
+    discriminator_checkpoint_dir = os.path.join(checkpoint_dir,
+                                                'discriminator')
+    os.makedirs(generator_checkpoint_dir, exist_ok=True)
+    os.makedirs(discriminator_checkpoint_dir, exist_ok=True)
+
+    if config.deepspeed_zero_stage == 3:
+        resume_generator_model = os.path.join(
+            generator_checkpoint_dir,
+            'zero_pp_rank_0_mp_rank_00_model_states.pt')
+    else:
+        resume_generator_model = os.path.join(generator_checkpoint_dir,
+                                              'mp_rank_00_model_states.pt')
+    # Discriminator always uses ZeRO Stage 0, so always non-ZeRO-3 path
+    resume_discriminator_model = os.path.join(discriminator_checkpoint_dir,
+                                              'mp_rank_00_model_states.pt')
 
     set_seed(config.seed)
 
@@ -551,7 +699,7 @@ def main():
     config.local_rank = local_rank
     # start init process
     torch.cuda.set_device(local_rank)
-    torch.distributed.init_process_group(backend='nccl', init_method='env://')
+    deepspeed.init_distributed(dist_backend='nccl')
 
     # 获取total_rank
     total_rank = torch.distributed.get_rank()
@@ -643,7 +791,7 @@ def main():
         log_info = f'name: {name}, grad: {buffer.requires_grad}'
         logger.info(log_info) if local_rank == 0 and total_rank == 0 else None
 
-    generator_optimizer, generator_model_layer_weight_decay_list = build_optimizer(
+    generator_model_params_weight_decay_list, generator_model_layer_weight_decay_list = build_param_groups(
         config, generator_model, model_type='generator_model')
 
     log_info = f'-------------generator model layers weight decay---------------'
@@ -661,7 +809,7 @@ def main():
             logger.info(
                 log_info) if local_rank == 0 and total_rank == 0 else None
 
-    discriminator_optimizer, discriminator_model_layer_weight_decay_list = build_optimizer(
+    discriminator_model_params_weight_decay_list, discriminator_model_layer_weight_decay_list = build_param_groups(
         config, discriminator_model, model_type='discriminator_model')
 
     log_info = f'-------------discriminator model layers weight decay---------------'
@@ -679,50 +827,7 @@ def main():
             logger.info(
                 log_info) if local_rank == 0 and total_rank == 0 else None
 
-    generator_scheduler = Scheduler(config,
-                                    generator_optimizer,
-                                    model_type='generator_model')
-    discriminator_scheduler = Scheduler(config,
-                                        discriminator_optimizer,
-                                        model_type='discriminator_model')
-
-    generator_model, _, config.generator_scaler = build_training_mode(
-        config, generator_model)
-    discriminator_model, _, config.discriminator_scaler = build_training_mode(
-        config, discriminator_model)
-
-    start_epoch, train_time = 1, 0
-    best_loss, train_loss = 1e9, 0
-    if os.path.exists(resume_model):
-        checkpoint = torch.load(resume_model,
-                                map_location=torch.device('cpu'),
-                                weights_only=True)
-        generator_model.load_state_dict(
-            checkpoint['generator_model_state_dict'])
-        discriminator_model.load_state_dict(
-            checkpoint['discriminator_model_state_dict'])
-        generator_optimizer.load_state_dict(
-            checkpoint['generator_optimizer_state_dict'])
-        discriminator_optimizer.load_state_dict(
-            checkpoint['discriminator_optimizer_state_dict'])
-        generator_scheduler.load_state_dict(
-            checkpoint['generator_scheduler_state_dict'])
-        discriminator_scheduler.load_state_dict(
-            checkpoint['discriminator_scheduler_state_dict'])
-
-        saved_epoch = checkpoint['epoch']
-        start_epoch += saved_epoch
-        used_time = checkpoint['time']
-        train_time += used_time
-
-        best_loss, train_loss, generator_lr, discriminator_lr = checkpoint[
-            'best_loss'], checkpoint['train_loss'], checkpoint[
-                'generator_lr'], checkpoint['discriminator_lr']
-
-        log_info = f'resuming model from {resume_model}. resume_epoch: {saved_epoch:0>3d}, used_time: {used_time:.3f} hours, best_loss: {best_loss:.4f}, generator_lr: {generator_lr:.6f}, discriminator_lr: {discriminator_lr:.6f}'
-        logger.info(log_info) if local_rank == 0 and total_rank == 0 else None
-
-    # use torch 2.0 compile function
+    # Check torch compile support
     config.compile_support = False
     log_info = f'using torch version:{torch.__version__}'
     logger.info(log_info) if local_rank == 0 and total_rank == 0 else None
@@ -739,12 +844,81 @@ def main():
         return
 
     config.use_compile = (config.compile_support and config.use_compile)
+
+    if config.sync_bn:
+        generator_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(
+            generator_model)
+        discriminator_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(
+            discriminator_model)
+
     if config.use_compile:
         # _orig_mod
         generator_model = torch.compile(generator_model,
                                         **config.compile_params)
         discriminator_model = torch.compile(discriminator_model,
                                             **config.compile_params)
+
+    # Build DeepSpeed config and initialize engines
+    generator_ds_config = build_deepspeed_config(config,
+                                                 model_type='generator_model')
+    log_info = f'Generator DeepSpeed config: {generator_ds_config}'
+    logger.info(log_info) if local_rank == 0 and total_rank == 0 else None
+
+    discriminator_ds_config = build_deepspeed_config(
+        config, model_type='discriminator_model')
+    log_info = f'Discriminator DeepSpeed config: {discriminator_ds_config}'
+    logger.info(log_info) if local_rank == 0 and total_rank == 0 else None
+
+    # Let DeepSpeed create the optimizer from ds_config (which includes the
+    # "optimizer" section). Pass model_parameters for per-layer weight decay
+    # and lr differentiation. DeepSpeed natively handles SGD/AdamW/Muon,
+    # ensuring correct optimizer state partitioning under ZeRO stage 1/2/3.
+    # for deepspeed==0.18.8, Muon optimizer is not yet compatible with ZeRO Stage 3,only support ZeRO stage 0/1/2.
+    generator_model_engine, generator_optimizer, _, _ = deepspeed.initialize(
+        model=generator_model,
+        model_parameters=generator_model_params_weight_decay_list,
+        config=generator_ds_config)
+
+    discriminator_model_engine, discriminator_optimizer, _, _ = deepspeed.initialize(
+        model=discriminator_model,
+        model_parameters=discriminator_model_params_weight_decay_list,
+        config=discriminator_ds_config)
+
+    # Build scheduler after DeepSpeed creates the optimizer. The scheduler
+    # adjusts LR via optimizer.param_groups which DeepSpeed's optimizer
+    # wrapper correctly exposes and delegates to the underlying optimizer.
+    generator_scheduler = Scheduler(config,
+                                    generator_optimizer,
+                                    model_type='generator_model')
+    discriminator_scheduler = Scheduler(config,
+                                        discriminator_optimizer,
+                                        model_type='discriminator_model')
+
+    start_epoch, train_time = 1, 0
+    best_loss, train_loss = 1e9, 0
+    # Resume from DeepSpeed checkpoint (generator uses tag="generator", discriminator uses tag="discriminator")
+    if os.path.exists(resume_generator_model) and os.path.exists(
+            resume_discriminator_model):
+        _, client_state = generator_model_engine.load_checkpoint(
+            generator_checkpoint_dir, tag="")
+        discriminator_model_engine.load_checkpoint(
+            discriminator_checkpoint_dir, tag="")
+        if client_state is not None:
+            saved_epoch = client_state['epoch']
+            start_epoch += saved_epoch
+            used_time = client_state['time']
+            train_time += used_time
+
+            best_loss = client_state['best_loss']
+            train_loss = client_state['train_loss']
+            generator_scheduler.load_state_dict(
+                client_state['generator_scheduler_state_dict'])
+            discriminator_scheduler.load_state_dict(
+                client_state['discriminator_scheduler_state_dict'])
+
+            log_info = f'resuming model from {resume_generator_model} and {resume_discriminator_model}. resume_epoch: {saved_epoch:0>3d}, used_time: {used_time:.3f} hours, best_loss: {best_loss:.4f}, generator_lr: {generator_scheduler.current_lr:.6f}, discriminator_lr: {discriminator_scheduler.current_lr:.6f}'
+            logger.info(
+                log_info) if local_rank == 0 and total_rank == 0 else None
 
     for epoch in range(start_epoch, config.epochs + 1):
         per_epoch_start_time = time.time()
@@ -757,10 +931,11 @@ def main():
         torch.cuda.empty_cache()
 
         train_sampler.set_epoch(epoch)
-        generator_loss, discriminator_loss, total_loss = train_flux_autoencoder_model(
-            train_loader, generator_model, discriminator_model, criterion,
-            generator_optimizer, discriminator_optimizer, generator_scheduler,
-            discriminator_scheduler, epoch, logger, config)
+        generator_loss, discriminator_loss, total_loss = train_flux_autoencoder_model_deepspeed(
+            train_loader, generator_model_engine, discriminator_model_engine,
+            criterion, generator_optimizer, discriminator_optimizer,
+            generator_scheduler, discriminator_scheduler, epoch, logger,
+            config)
         log_info = f'train: epoch {epoch:0>3d}, generator_loss: {generator_loss:.4f}, discriminator_loss: {discriminator_loss:.4f}, total_loss: {total_loss:.4f}'
         logger.info(log_info) if local_rank == 0 and total_rank == 0 else None
 
@@ -770,87 +945,105 @@ def main():
 
         train_time += (time.time() - per_epoch_start_time) / 3600
 
-        if epoch in config.save_epochs or epoch == config.epochs:
-            if local_rank == 0 and total_rank == 0:
-                if config.use_compile:
-                    save_generator_model = generator_model._orig_mod.module.state_dict(
-                    )
-                    save_discriminator_model = discriminator_model._orig_mod.module.state_dict(
-                    )
-                else:
-                    save_generator_model = generator_model.module.state_dict()
-                    save_discriminator_model = discriminator_model.module.state_dict(
-                    )
+        # train_loss is consistent across all ranks (all_reduced in
+        # train_flux_autoencoder_model_deepspeed), so is_best is identical on every rank.
+        is_best = train_loss < best_loss
+        if is_best:
+            best_loss = train_loss
 
-                torch.save(
-                    save_generator_model,
-                    os.path.join(checkpoint_dir,
-                                 f'epoch_{epoch}_generator_model.pth'))
+        if epoch in config.save_epochs or epoch == config.epochs:
+            # Generator: save depends on config.deepspeed_zero_stage
+            if config.deepspeed_zero_stage == 3:
+                # ZeRO-3: all ranks must participate in GatheredParameters
+                save_generator_model = get_model_state_dict(
+                    generator_model_engine, config,
+                    config.deepspeed_zero_stage)
+                if local_rank == 0 and total_rank == 0:
+                    if save_generator_model is not None:
+                        torch.save(
+                            save_generator_model,
+                            os.path.join(checkpoint_dir,
+                                         f'epoch_{epoch}_generator_model.pth'))
+            else:
+                # ZeRO-0/1/2: only global rank 0 needs to call state_dict
+                if local_rank == 0 and total_rank == 0:
+                    save_generator_model = get_model_state_dict(
+                        generator_model_engine, config,
+                        config.deepspeed_zero_stage)
+                    torch.save(
+                        save_generator_model,
+                        os.path.join(checkpoint_dir,
+                                     f'epoch_{epoch}_generator_model.pth'))
+            # Discriminator: always ZeRO Stage 0, only rank 0 saves
+            if local_rank == 0 and total_rank == 0:
+                save_discriminator_model = get_model_state_dict(
+                    discriminator_model_engine, config,
+                    DISCRIMINATOR_ZERO_STAGE)
                 torch.save(
                     save_discriminator_model,
                     os.path.join(checkpoint_dir,
                                  f'epoch_{epoch}_discriminator_model.pth'))
 
-        if local_rank == 0 and total_rank == 0:
-            # save best loss model and each epoch checkpoint
-            if train_loss < best_loss:
-                best_loss = train_loss
-                if config.use_compile:
-                    save_best_generator_model = generator_model._orig_mod.module.state_dict(
-                    )
-                    save_best_discriminator_model = discriminator_model._orig_mod.module.state_dict(
-                    )
-                else:
-                    save_best_generator_model = generator_model.module.state_dict(
-                    )
-                    save_best_discriminator_model = discriminator_model.module.state_dict(
-                    )
-
-                torch.save(
-                    save_best_generator_model,
-                    os.path.join(checkpoint_dir, 'best_generator_model.pth'))
+        if is_best:
+            # Generator: save depends on config.deepspeed_zero_stage
+            if config.deepspeed_zero_stage == 3:
+                save_best_generator_model = get_model_state_dict(
+                    generator_model_engine, config,
+                    config.deepspeed_zero_stage)
+                if local_rank == 0 and total_rank == 0:
+                    if save_best_generator_model is not None:
+                        torch.save(
+                            save_best_generator_model,
+                            os.path.join(checkpoint_dir,
+                                         'best_generator_model.pth'))
+            else:
+                if local_rank == 0 and total_rank == 0:
+                    save_best_generator_model = get_model_state_dict(
+                        generator_model_engine, config,
+                        config.deepspeed_zero_stage)
+                    torch.save(
+                        save_best_generator_model,
+                        os.path.join(checkpoint_dir,
+                                     'best_generator_model.pth'))
+            # Discriminator: always ZeRO Stage 0, only rank 0 saves
+            if local_rank == 0 and total_rank == 0:
+                save_best_discriminator_model = get_model_state_dict(
+                    discriminator_model_engine, config,
+                    DISCRIMINATOR_ZERO_STAGE)
                 torch.save(
                     save_best_discriminator_model,
                     os.path.join(checkpoint_dir,
                                  'best_discriminator_model.pth'))
 
-            if config.use_compile:
-                save_checkpoint_generator_model = generator_model._orig_mod.state_dict(
-                )
-                save_checkpoint_discriminator_model = discriminator_model._orig_mod.state_dict(
-                )
-            else:
-                save_checkpoint_generator_model = generator_model.state_dict()
-                save_checkpoint_discriminator_model = discriminator_model.state_dict(
-                )
-
-            torch.save(
-                {
-                    'epoch':
-                    epoch,
-                    'time':
-                    train_time,
-                    'best_loss':
-                    best_loss,
-                    'train_loss':
-                    train_loss,
-                    'generator_lr':
-                    generator_scheduler.current_lr,
-                    'discriminator_lr':
-                    discriminator_scheduler.current_lr,
-                    'generator_model_state_dict':
-                    save_checkpoint_generator_model,
-                    'discriminator_model_state_dict':
-                    save_checkpoint_discriminator_model,
-                    'generator_optimizer_state_dict':
-                    generator_optimizer.state_dict(),
-                    'discriminator_optimizer_state_dict':
-                    discriminator_optimizer.state_dict(),
-                    'generator_scheduler_state_dict':
-                    generator_scheduler.state_dict(),
-                    'discriminator_scheduler_state_dict':
-                    discriminator_scheduler.state_dict(),
-                }, os.path.join(checkpoint_dir, 'latest.pth'))
+        # Save DeepSpeed checkpoint for resume (all ranks participate)
+        # client_state is saved with generator engine only
+        client_state = {
+            'epoch':
+            epoch,
+            'time':
+            train_time,
+            'best_loss':
+            best_loss,
+            'train_loss':
+            train_loss,
+            'generator_lr':
+            generator_scheduler.current_lr,
+            'discriminator_lr':
+            discriminator_scheduler.current_lr,
+            'generator_scheduler_state_dict':
+            generator_scheduler.state_dict(),
+            'discriminator_scheduler_state_dict':
+            discriminator_scheduler.state_dict(),
+        }
+        generator_model_engine.save_checkpoint(generator_checkpoint_dir,
+                                               tag="",
+                                               client_state=client_state,
+                                               save_latest=False)
+        discriminator_model_engine.save_checkpoint(
+            discriminator_checkpoint_dir,
+            tag="",
+            client_state=None,
+            save_latest=False)
 
         log_info = f'until epoch: {epoch:0>3d}, best_loss: {best_loss:.4f}'
         logger.info(log_info) if local_rank == 0 and total_rank == 0 else None

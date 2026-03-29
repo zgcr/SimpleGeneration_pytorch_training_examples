@@ -6,7 +6,6 @@ log
 *log*
 *temp*
 *tmp*
-*.pth
 *.onnx
 *.pt
 *.log

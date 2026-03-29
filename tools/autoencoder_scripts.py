@@ -1,6 +1,7 @@
 import os
 import sys
 import warnings
+from contextlib import nullcontext
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(BASE_DIR)
@@ -15,6 +16,8 @@ from skimage.metrics import peak_signal_noise_ratio as compare_psnr
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+import deepspeed
 
 from torch.amp.autocast_mode import autocast
 
@@ -487,6 +490,293 @@ def train_flux_autoencoder_model(train_loader, generator_model,
 
     total_loss = total_losses.avg
     total_loss = total_loss * config.accumulation_steps
+
+    return avg_generator_loss, avg_discriminator_loss, total_loss
+
+
+def train_flux_autoencoder_model_deepspeed(
+        train_loader, generator_model, discriminator_model, criterion,
+        generator_optimizer, discriminator_optimizer, generator_scheduler,
+        discriminator_scheduler, epoch, logger, config):
+    '''
+    train flux autoencoder model for one epoch using DeepSpeed engine.
+    generator_model: DeepSpeed engine for generator
+    discriminator_model: DeepSpeed engine for discriminator
+    '''
+    generator_losses = AverageMeter()
+    discriminator_losses = AverageMeter()
+    total_losses = AverageMeter()
+
+    # switch to train mode
+    generator_model.train()
+    discriminator_model.train()
+
+    # Extract bare models: DeepSpeed engine wraps model in .module
+    if config.use_compile:
+        bare_generator = generator_model.module._orig_mod
+        bare_discriminator = discriminator_model.module._orig_mod
+    else:
+        bare_generator = generator_model.module
+        bare_discriminator = discriminator_model.module
+
+    local_rank = config.local_rank
+    if hasattr(config, 'total_rank'):
+        total_rank = config.total_rank
+    else:
+        total_rank = 0
+
+    log_info = f'use_amp: {config.use_amp}, amp_type: {config.amp_type}!'
+    logger.info(log_info) if local_rank == 0 and total_rank == 0 else None
+
+    iters = len(train_loader.dataset) // config.batch_size
+    iter_index = 1
+    assert config.accumulation_steps >= 1, 'illegal accumulation_steps!'
+
+    for _, data in enumerate(train_loader):
+        images = data['image']
+        images = images.cuda()
+
+        accumulation_iter_index, accumulation_iters = int(
+            iter_index // config.accumulation_steps), int(
+                iters // config.accumulation_steps)
+        total_accumulation_iters = accumulation_iters * (
+            epoch - 1) + accumulation_iter_index
+
+        # for generator training
+        ########################################################################################
+        # Build GatheredParameters context for ZeRO Stage 3: logvar and
+        # decoder.conv_out.weight are accessed after forward_train completes,
+        # at which point ZeRO-3 has released them back to local shards.
+        if config.deepspeed_zero_stage == 3:
+            gather_ctx = deepspeed.zero.GatheredParameters(
+                [bare_generator.logvar,
+                 bare_generator.get_last_layer()])
+        else:
+            gather_ctx = nullcontext()
+
+        if config.use_amp:
+            with autocast(device_type="cuda", dtype=config.amp_type):
+                reconstruction_images, kl_out = bare_generator.forward_train(
+                    images)
+                with gather_ctx:
+                    loss_dict = criterion(
+                        images,
+                        reconstruction_images,
+                        logvar=bare_generator.logvar,
+                        kl_out=kl_out,
+                        loss_type='generator_loss',
+                        last_layer=bare_generator.get_last_layer())
+        else:
+            reconstruction_images, kl_out = bare_generator.forward_train(
+                images)
+            with gather_ctx:
+                loss_dict = criterion(
+                    images,
+                    reconstruction_images,
+                    logvar=bare_generator.logvar,
+                    kl_out=kl_out,
+                    loss_type='generator_loss',
+                    last_layer=bare_generator.get_last_layer())
+
+        generator_loss_dict = {}
+        generator_fake = 0.
+        for key, value in loss_dict.items():
+            if key == 'generator_fake':
+                generator_fake = value
+            else:
+                generator_loss_dict[key] = value
+
+        # before generator_loss_start_step,don't train generator_model
+        if total_accumulation_iters < config.generator_loss_start_step:
+            for key in generator_loss_dict.keys():
+                generator_loss_dict[key] = 0. * generator_loss_dict[key]
+
+        # before discriminator_loss_start_step,don't train discriminator_model
+        if total_accumulation_iters < config.discriminator_loss_start_step:
+            generator_loss_dict[
+                'generator_adversarial_loss'] = 0. * generator_loss_dict[
+                    'generator_adversarial_loss']
+
+        generator_loss = 0.
+        for key, value in generator_loss_dict.items():
+            generator_loss += value
+
+        # Freeze discriminator params before generator backward to prevent
+        # DeepSpeed ZeRO Stage 2/3 backward hooks from triggering on
+        # discriminator parameters (gradients still flow through discriminator
+        # ops to generator via autograd computation graph).
+        for param in discriminator_model.module.parameters():
+            param.requires_grad = False
+
+        # DeepSpeed backward and step for generator
+        generator_model.backward(generator_loss)
+        generator_model.step()
+
+        # Unfreeze discriminator params for discriminator training
+        for param in discriminator_model.module.parameters():
+            param.requires_grad = True
+
+        ########################################################################################
+        # for discriminator training
+        if config.use_amp:
+            with autocast(device_type="cuda", dtype=config.amp_type):
+                loss_dict = criterion(images,
+                                      reconstruction_images,
+                                      loss_type='discriminator_loss')
+        else:
+            loss_dict = criterion(images,
+                                  reconstruction_images,
+                                  loss_type='discriminator_loss')
+
+        discriminator_loss_dict = {}
+        discriminator_real = 0.
+        discriminator_fake = 0.
+        for key, value in loss_dict.items():
+            if key == 'discriminator_real':
+                discriminator_real = value
+            elif key == 'discriminator_fake':
+                discriminator_fake = value
+            else:
+                discriminator_loss_dict[key] = value
+
+        # before discriminator_loss_start_step,don't train discriminator_model
+        if total_accumulation_iters < config.discriminator_loss_start_step:
+            discriminator_loss_dict[
+                'discriminator_adversarial_loss'] = 0. * discriminator_loss_dict[
+                    'discriminator_adversarial_loss']
+
+        discriminator_loss = 0.
+        for key, value in discriminator_loss_dict.items():
+            discriminator_loss += value
+
+        # DeepSpeed backward and step for discriminator
+        discriminator_model.backward(discriminator_loss)
+        discriminator_model.step()
+
+        #########################################################################
+
+        if iter_index % config.accumulation_steps == 0:
+            for key, value in generator_loss_dict.items():
+                [value] = all_reduce_operation_in_group_for_variables(
+                    variables=[value],
+                    operator=torch.distributed.ReduceOp.SUM,
+                    group=config.group)
+                generator_loss_dict[key] = value / float(config.gpus_num)
+
+            for key, value in discriminator_loss_dict.items():
+                [value] = all_reduce_operation_in_group_for_variables(
+                    variables=[value],
+                    operator=torch.distributed.ReduceOp.SUM,
+                    group=config.group)
+                discriminator_loss_dict[key] = value / float(config.gpus_num)
+
+            generator_fake = generator_fake.detach().mean()
+            [generator_fake] = all_reduce_operation_in_group_for_variables(
+                variables=[generator_fake],
+                operator=torch.distributed.ReduceOp.SUM,
+                group=config.group)
+            generator_fake = generator_fake / float(config.gpus_num)
+
+            discriminator_real = discriminator_real.detach().mean()
+            [discriminator_real] = all_reduce_operation_in_group_for_variables(
+                variables=[discriminator_real],
+                operator=torch.distributed.ReduceOp.SUM,
+                group=config.group)
+            discriminator_real = discriminator_real / float(config.gpus_num)
+
+            discriminator_fake = discriminator_fake.detach().mean()
+            [discriminator_fake] = all_reduce_operation_in_group_for_variables(
+                variables=[discriminator_fake],
+                operator=torch.distributed.ReduceOp.SUM,
+                group=config.group)
+            discriminator_fake = discriminator_fake / float(config.gpus_num)
+
+            [generator_loss] = all_reduce_operation_in_group_for_variables(
+                variables=[generator_loss],
+                operator=torch.distributed.ReduceOp.SUM,
+                group=config.group)
+            generator_loss = generator_loss / float(config.gpus_num)
+            generator_losses.update(generator_loss, images.size(0))
+
+            [discriminator_loss] = all_reduce_operation_in_group_for_variables(
+                variables=[discriminator_loss],
+                operator=torch.distributed.ReduceOp.SUM,
+                group=config.group)
+            discriminator_loss = discriminator_loss / float(config.gpus_num)
+            discriminator_losses.update(discriminator_loss, images.size(0))
+
+            total_loss = generator_loss + discriminator_loss
+            total_losses.update(total_loss, images.size(0))
+
+        if iter_index % config.accumulation_steps == 0:
+            generator_scheduler.step(generator_optimizer,
+                                     iter_index / iters + (epoch - 1))
+            discriminator_scheduler.step(discriminator_optimizer,
+                                         iter_index / iters + (epoch - 1))
+
+        accumulation_iter_index, accumulation_iters = int(
+            iter_index // config.accumulation_steps), int(
+                iters // config.accumulation_steps)
+        if iter_index % int(
+                config.print_interval * config.accumulation_steps) == 0:
+            log_info = f'train: epoch {epoch:0>4d}, iter [{accumulation_iter_index:0>5d}, {accumulation_iters:0>5d}], generator_lr: {generator_scheduler.current_lr:.6f}, discriminator_lr: {discriminator_scheduler.current_lr:.6f}, \n'
+            log_info += f'generator_loss: {generator_loss:.4f}, discriminator_loss: {discriminator_loss:.4f}, total_loss: {total_loss:.4f}\n'
+            log_info += f'generator_fake: {generator_fake:.4f}, discriminator_real: {discriminator_real:.4f}, discriminator_fake: {discriminator_fake:.4f}, \n'
+            for key, value in generator_loss_dict.items():
+                log_info += f'{key}: {value:.8f}, '
+            log_info += f'\n'
+            for key, value in discriminator_loss_dict.items():
+                log_info += f'{key}: {value:.8f}, '
+            logger.info(
+                log_info) if local_rank == 0 and total_rank == 0 else None
+
+        total_accumulation_iters = accumulation_iters * (
+            epoch - 1) + accumulation_iter_index
+        if hasattr(config,
+                   'use_step_save_interval') and config.use_step_save_interval:
+            if total_accumulation_iters % config.step_save_interval == 0:
+                if config.use_compile:
+                    generator_module = generator_model.module._orig_mod
+                    discriminator_module = discriminator_model.module._orig_mod
+                else:
+                    generator_module = generator_model.module
+                    discriminator_module = discriminator_model.module
+
+                generator_save_path = os.path.join(
+                    config.checkpoint_dir,
+                    f'step_{total_accumulation_iters}_generator_model.pth')
+                discriminator_save_path = os.path.join(
+                    config.checkpoint_dir,
+                    f'step_{total_accumulation_iters}_discriminator_model.pth')
+
+                # Generator: respect ZeRO stage for parameter gathering
+                if config.deepspeed_zero_stage == 3:
+                    generator_state_dict = {}
+                    for name, param in generator_module.named_parameters():
+                        with deepspeed.zero.GatheredParameters(param):
+                            if local_rank == 0 and total_rank == 0:
+                                generator_state_dict[name] = param.data.cpu(
+                                ).clone()
+                    for name, buf in generator_module.named_buffers():
+                        if local_rank == 0 and total_rank == 0:
+                            generator_state_dict[name] = buf.cpu().clone()
+                    if local_rank == 0 and total_rank == 0:
+                        torch.save(generator_state_dict, generator_save_path)
+                else:
+                    if local_rank == 0 and total_rank == 0:
+                        torch.save(generator_module.state_dict(),
+                                   generator_save_path)
+
+                # Discriminator: always ZeRO Stage 0, no parameter partitioning
+                if local_rank == 0 and total_rank == 0:
+                    torch.save(discriminator_module.state_dict(),
+                               discriminator_save_path)
+
+        iter_index += 1
+
+    avg_generator_loss = generator_losses.avg
+    avg_discriminator_loss = discriminator_losses.avg
+    total_loss = total_losses.avg
 
     return avg_generator_loss, avg_discriminator_loss, total_loss
 
