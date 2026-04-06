@@ -17,7 +17,7 @@ import deepspeed
 from torch.utils.data import DataLoader
 
 from tools.image_tokenizer_scripts import train_vqgan_model_deepspeed
-from tools.utils import (set_seed, get_logger, worker_seed_init_fn)
+from tools.utils import (get_logger, set_seed, worker_seed_init_fn)
 
 # PatchGANDiscriminator is very small (~2.77M params, ~44 MB total memory
 # per GPU including optimizer states). ZeRO partitioning brings negligible
@@ -26,9 +26,10 @@ DISCRIMINATOR_ZERO_STAGE = 0
 
 
 def build_param_groups(config, model, model_type):
-    """Build parameter groups for optimizer (weight decay differentiation).
+    """Build parameter groups for DeepSpeed optimizer.
+    For AdamW: differentiate weight decay (1D params and specified layers get 0).
+    For Muon: pass all trainable params; DeepSpeed native Muon handles split.
     Returns (model_params_weight_decay_list, model_layer_weight_decay_list).
-    Does NOT create the optimizer — DeepSpeed will create it from ds_config.
     """
     assert model_type in [
         'generator_model',
@@ -46,9 +47,10 @@ def build_param_groups(config, model, model_type):
     lr = optimizer_parameters['lr']
     weight_decay = optimizer_parameters['weight_decay']
 
-    # For Muon, DeepSpeed native implementation handles muon/adamw param
-    # split internally (>=2D params use Muon, others use AdamW fallback).
-    # We only need to pass all trainable parameters and build logging info.
+    # For Muon, DeepSpeed 0.18.9 native implementation requires each
+    # parameter to have a `use_muon` attribute (True/False) so that
+    # the engine can split params into Muon group (ndim>=2) and
+    # AdamW fallback group (ndim<2).
     if optimizer_name == 'Muon':
         muon_param_names = []
         adamw_param_names = []
@@ -57,12 +59,13 @@ def build_param_groups(config, model, model_type):
             if not param.requires_grad:
                 continue
             all_params.append(param)
-            # DeepSpeed native Muon uses param.ndim >= 2 internally
-            # to decide Muon vs AdamW fallback, mirror that logic here
-            # for accurate logging.
+            # DeepSpeed 0.18.9 engine.py requires `param.use_muon`
+            # attribute on every parameter. Set it based on ndim >= 2.
             if param.ndim >= 2:
+                param.use_muon = True
                 muon_param_names.append(name)
             else:
+                param.use_muon = False
                 adamw_param_names.append(name)
 
         model_params_weight_decay_list = all_params
@@ -439,8 +442,12 @@ def build_deepspeed_config(config, model_type):
                 "dtype": "bfloat16",
             }
     else:
-        ds_config["fp16"] = {"enabled": False}
-        ds_config["bf16"] = {"enabled": False}
+        ds_config["fp16"] = {
+            "enabled": False,
+        }
+        ds_config["bf16"] = {
+            "enabled": False,
+        }
 
     # ZeRO-Offload
     if hasattr(config, 'deepspeed_offload') and config.deepspeed_offload:
@@ -463,64 +470,72 @@ def build_deepspeed_config(config, model_type):
         ds_config["zero_optimization"][
             "stage3_gather_16bit_weights_on_model_save"] = True
 
+    ds_config["flops_profiler"] = {
+        "enabled": True,
+        "profile_step": 1,  # 在第1个step进行profiling
+        "module_depth": -1,  # -1表示打印所有层级
+        "top_modules": 3,  # 打印top 3模块
+        "detailed": True,  # 打印详细信息
+        "output_file": None,  # None表示输出到DeepSpeed log(终端/日志)
+    }
+
     # Optimizer (let DeepSpeed create the optimizer natively for ZeRO
     # compatibility, especially for Muon which requires native support
     # under ZeRO stage 1/2/3).
     assert optimizer_name in ['SGD', 'AdamW', 'Muon'], 'Unsupported optimizer!'
 
+    # for deepspeed==0.18.9, muon optimizer for zero stage3, reduce_scatter must be false, use allreduce instead
+    if optimizer_name == 'Muon' and zero_stage == 3:
+        ds_config["zero_optimization"]["reduce_scatter"] = False
+
     if optimizer_name == 'SGD':
-        momentum = 0.9 if 'momentum' not in optimizer_parameters.keys(
-        ) else optimizer_parameters['momentum']
-        nesterov = False if 'nesterov' not in optimizer_parameters.keys(
-        ) else optimizer_parameters['nesterov']
         ds_config["optimizer"] = {
             "type": "SGD",
             "params": {
                 "lr": optimizer_parameters['lr'],
-                "momentum": momentum,
-                "nesterov": nesterov,
+                "momentum": optimizer_parameters.get('momentum', 0.9),
+                "nesterov": optimizer_parameters.get('nesterov', False),
                 "weight_decay": optimizer_parameters['weight_decay'],
             }
         }
     elif optimizer_name == 'AdamW':
-        beta1 = 0.9 if 'beta1' not in optimizer_parameters.keys(
-        ) else optimizer_parameters['beta1']
-        beta2 = 0.999 if 'beta2' not in optimizer_parameters.keys(
-        ) else optimizer_parameters['beta2']
-        eps = 1e-08 if 'eps' not in optimizer_parameters.keys(
-        ) else optimizer_parameters['eps']
         ds_config["optimizer"] = {
             "type": "AdamW",
             "params": {
-                "lr": optimizer_parameters['lr'],
-                "betas": [beta1, beta2],
-                "eps": eps,
-                "weight_decay": optimizer_parameters['weight_decay'],
+                "lr":
+                optimizer_parameters['lr'],
+                "betas": [
+                    optimizer_parameters.get('beta1', 0.9),
+                    optimizer_parameters.get('beta2', 0.999)
+                ],
+                "eps":
+                optimizer_parameters.get('eps', 1e-08),
+                "weight_decay":
+                optimizer_parameters['weight_decay'],
             }
         }
     elif optimizer_name == 'Muon':
-        momentum = 0.95 if 'momentum' not in optimizer_parameters.keys(
-        ) else optimizer_parameters['momentum']
-        nesterov = True if 'nesterov' not in optimizer_parameters.keys(
-        ) else optimizer_parameters['nesterov']
-        ns_steps = 5 if 'ns_steps' not in optimizer_parameters.keys(
-        ) else optimizer_parameters['ns_steps']
-        adamw_beta1 = 0.9 if 'adamw_beta1' not in optimizer_parameters.keys(
-        ) else optimizer_parameters['adamw_beta1']
-        adamw_beta2 = 0.999 if 'adamw_beta2' not in optimizer_parameters.keys(
-        ) else optimizer_parameters['adamw_beta2']
-        adamw_eps = 1e-08 if 'adamw_eps' not in optimizer_parameters.keys(
-        ) else optimizer_parameters['adamw_eps']
+        # DeepSpeed 0.18.9 engine.py _configure_basic_optimizer() only
+        # recognizes these keys for Muon param groups:
+        #   muon group:  ["lr", "momentum", "weight_decay", "muon_lr"]
+        #   adamw group: ["lr", "betas", "eps", "weight_decay", "adam_lr"]
+        # Keys like "wd", "nesterov", "ns_steps", "adamw_betas", "adamw_eps"
+        # are NOT recognized and will be silently ignored.
         ds_config["optimizer"] = {
             "type": "Muon",
             "params": {
-                "lr": optimizer_parameters['lr'],
-                "wd": optimizer_parameters['weight_decay'],
-                "momentum": momentum,
-                "nesterov": nesterov,
-                "ns_steps": ns_steps,
-                "adamw_betas": [adamw_beta1, adamw_beta2],
-                "adamw_eps": adamw_eps,
+                "lr":
+                optimizer_parameters['lr'],
+                "weight_decay":
+                optimizer_parameters['weight_decay'],
+                "momentum":
+                optimizer_parameters.get('momentum', 0.95),
+                "betas": [
+                    optimizer_parameters.get('adamw_beta1', 0.9),
+                    optimizer_parameters.get('adamw_beta2', 0.999)
+                ],
+                "eps":
+                optimizer_parameters.get('adamw_eps', 1e-08),
             }
         }
 
@@ -528,10 +543,9 @@ def build_deepspeed_config(config, model_type):
 
 
 def get_model_state_dict(model_engine, config, zero_stage):
-    """
-    Get full model state dict for saving.
-    For ZeRO-3, all ranks must call this function (GatheredParameters is
-    collective), but only rank 0 returns a non-None dict.
+    """Get full model state dict for saving.
+    For ZeRO-3, all ranks must call (GatheredParameters is collective),
+    but only rank 0 returns a non-None dict.
     """
     if config.use_compile:
         module = model_engine.module._orig_mod
@@ -539,15 +553,17 @@ def get_model_state_dict(model_engine, config, zero_stage):
         module = model_engine.module
 
     if zero_stage == 3:
-        state_dict = {}
-        for name, param in module.named_parameters():
-            with deepspeed.zero.GatheredParameters(param):
-                if config.total_rank == 0 and config.local_rank == 0:
-                    state_dict[name] = param.data.cpu().clone()
-        for name, buf in module.named_buffers():
+        # Batch gather all parameters at once to reduce communication rounds
+        all_params = list(module.parameters())
+        with deepspeed.zero.GatheredParameters(all_params):
             if config.total_rank == 0 and config.local_rank == 0:
-                state_dict[name] = buf.cpu().clone()
-        return state_dict if config.total_rank == 0 and config.local_rank == 0 else None
+                state_dict = {
+                    k: v.cpu().clone()
+                    for k, v in module.state_dict().items()
+                }
+            else:
+                state_dict = None
+        return state_dict
     else:
         return module.state_dict()
 
@@ -673,7 +689,6 @@ def main():
     checkpoint_dir = os.path.join(args.work_dir, 'checkpoints')
     config.checkpoint_dir = checkpoint_dir
     config.gpus_type = torch.cuda.get_device_name()
-    config.gpus_num = torch.cuda.device_count()
 
     generator_checkpoint_dir = os.path.join(checkpoint_dir, 'generator')
     discriminator_checkpoint_dir = os.path.join(checkpoint_dir,
@@ -704,24 +719,10 @@ def main():
     total_rank = torch.distributed.get_rank()
     config.total_rank = total_rank
 
-    # 假设每个进程只使用一个GPU
-    # 获取当前node上进程数量
-    per_node_process_nums = int(os.environ['LOCAL_WORLD_SIZE'])
-    # 获取当前node上GPU数量
-    per_node_gpus_num = torch.cuda.device_count()
-    # 获取当前node上每个进程分配的GPU数量
-    per_node_per_process_gpus_num = int(per_node_gpus_num /
-                                        per_node_process_nums)
-    # 获取所有node上进程数量
-    world_size = torch.distributed.get_world_size()
-    # 获取所有node上GPU数量:每个进程分配的GPU数量×所有node上进程数量
-    config.gpus_num = int(per_node_per_process_gpus_num * world_size)
-    config.group = torch.distributed.new_group(list(range(config.gpus_num)))
+    config.gpus_num = torch.distributed.get_world_size()
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
-
-    torch.distributed.barrier(device_ids=[local_rank])
 
     logger = get_logger('train', log_dir)
 
@@ -950,69 +951,61 @@ def main():
         if is_best:
             best_loss = train_loss
 
-        if epoch in config.save_epochs or epoch == config.epochs:
+        # Merge save_interval and is_best saving to avoid redundant
+        # GatheredParameters calls under ZeRO-3 (each call triggers
+        # all-gather across all ranks for all parameters).
+        need_save_epoch = (epoch % config.save_interval == 0)
+        need_save_best = is_best
+
+        if need_save_epoch or need_save_best:
             # Generator: save depends on config.deepspeed_zero_stage
             if config.deepspeed_zero_stage == 3:
                 # ZeRO-3: all ranks must participate in GatheredParameters
                 save_generator_model = get_model_state_dict(
                     generator_model_engine, config,
                     config.deepspeed_zero_stage)
-                if local_rank == 0 and total_rank == 0:
-                    if save_generator_model is not None:
+                if local_rank == 0 and total_rank == 0 and save_generator_model is not None:
+                    if need_save_epoch:
                         torch.save(
                             save_generator_model,
                             os.path.join(checkpoint_dir,
                                          f'epoch_{epoch}_generator_model.pth'))
+                    if need_save_best:
+                        torch.save(
+                            save_generator_model,
+                            os.path.join(checkpoint_dir,
+                                         'best_generator_model.pth'))
             else:
                 # ZeRO-0/1/2: only global rank 0 needs to call state_dict
                 if local_rank == 0 and total_rank == 0:
                     save_generator_model = get_model_state_dict(
                         generator_model_engine, config,
                         config.deepspeed_zero_stage)
-                    torch.save(
-                        save_generator_model,
-                        os.path.join(checkpoint_dir,
-                                     f'epoch_{epoch}_generator_model.pth'))
+                    if need_save_epoch:
+                        torch.save(
+                            save_generator_model,
+                            os.path.join(checkpoint_dir,
+                                         f'epoch_{epoch}_generator_model.pth'))
+                    if need_save_best:
+                        torch.save(
+                            save_generator_model,
+                            os.path.join(checkpoint_dir,
+                                         'best_generator_model.pth'))
             # Discriminator: always ZeRO Stage 0, only rank 0 saves
             if local_rank == 0 and total_rank == 0:
                 save_discriminator_model = get_model_state_dict(
                     discriminator_model_engine, config,
                     DISCRIMINATOR_ZERO_STAGE)
-                torch.save(
-                    save_discriminator_model,
-                    os.path.join(checkpoint_dir,
-                                 f'epoch_{epoch}_discriminator_model.pth'))
-
-        if is_best:
-            # Generator: save depends on config.deepspeed_zero_stage
-            if config.deepspeed_zero_stage == 3:
-                save_best_generator_model = get_model_state_dict(
-                    generator_model_engine, config,
-                    config.deepspeed_zero_stage)
-                if local_rank == 0 and total_rank == 0:
-                    if save_best_generator_model is not None:
-                        torch.save(
-                            save_best_generator_model,
-                            os.path.join(checkpoint_dir,
-                                         'best_generator_model.pth'))
-            else:
-                if local_rank == 0 and total_rank == 0:
-                    save_best_generator_model = get_model_state_dict(
-                        generator_model_engine, config,
-                        config.deepspeed_zero_stage)
+                if need_save_epoch:
                     torch.save(
-                        save_best_generator_model,
+                        save_discriminator_model,
                         os.path.join(checkpoint_dir,
-                                     'best_generator_model.pth'))
-            # Discriminator: always ZeRO Stage 0, only rank 0 saves
-            if local_rank == 0 and total_rank == 0:
-                save_best_discriminator_model = get_model_state_dict(
-                    discriminator_model_engine, config,
-                    DISCRIMINATOR_ZERO_STAGE)
-                torch.save(
-                    save_best_discriminator_model,
-                    os.path.join(checkpoint_dir,
-                                 'best_discriminator_model.pth'))
+                                     f'epoch_{epoch}_discriminator_model.pth'))
+                if need_save_best:
+                    torch.save(
+                        save_discriminator_model,
+                        os.path.join(checkpoint_dir,
+                                     'best_discriminator_model.pth'))
 
         # Save DeepSpeed checkpoint for resume (all ranks participate)
         # client_state is saved with generator engine only

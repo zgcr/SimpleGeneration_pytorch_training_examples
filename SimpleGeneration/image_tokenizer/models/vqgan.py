@@ -409,7 +409,8 @@ class VectorQuantizer(nn.Module):
                          1. / codebook_size)
 
         self.register_buffer("codebook_used",
-                             torch.zeros(self.codebook_size, dtype=torch.bool))
+                             torch.zeros(self.codebook_size, dtype=torch.bool),
+                             persistent=False)
 
     def reset_codebook_used(self):
         with torch.no_grad():

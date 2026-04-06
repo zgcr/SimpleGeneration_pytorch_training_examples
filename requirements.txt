@@ -10,4 +10,4 @@ transformers
 yapf
 gpustat
 calflops
-deepspeed==0.18.8
+deepspeed==0.18.9

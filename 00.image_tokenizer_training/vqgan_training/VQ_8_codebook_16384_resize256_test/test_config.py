@@ -40,7 +40,7 @@ class config:
     # batch_size is total size
     batch_size = 64
     # num_workers is total workers
-    num_workers = 4
+    num_workers = 8
 
     use_amp = False
     # torch.float16 or torch.bfloat16

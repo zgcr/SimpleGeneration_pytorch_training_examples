@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from tools.image_tokenizer_scripts import train_fsq_model
-from tools.utils import (set_seed, get_logger, worker_seed_init_fn,
+from tools.utils import (get_logger, set_seed, worker_seed_init_fn,
                          build_optimizer, Scheduler, build_training_mode)
 
 
@@ -67,7 +67,6 @@ def main():
     world_size = torch.distributed.get_world_size()
     # 获取所有node上GPU数量:每个进程分配的GPU数量×所有node上进程数量
     config.gpus_num = int(per_node_per_process_gpus_num * world_size)
-    config.group = torch.distributed.new_group(list(range(config.gpus_num)))
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
@@ -209,19 +208,18 @@ def main():
 
         train_time += (time.time() - per_epoch_start_time) / 3600
 
-        if epoch in config.save_epochs or epoch == config.epochs:
+        if epoch % config.save_interval == 0:
             if local_rank == 0 and total_rank == 0:
                 if config.use_compile:
                     save_model = model._orig_mod.module.state_dict()
                 else:
                     save_model = model.module.state_dict()
-
                 torch.save(
                     save_model,
                     os.path.join(checkpoint_dir, f'epoch_{epoch}_model.pth'))
 
         if local_rank == 0 and total_rank == 0:
-            # save best loss model and each epoch checkpoint
+            # save best acc1 model and each epoch checkpoint
             if train_loss < best_loss:
                 best_loss = train_loss
                 if config.use_compile:

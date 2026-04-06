@@ -44,7 +44,6 @@ def main():
     # start init process
     torch.cuda.set_device(local_rank)
     torch.distributed.init_process_group(backend='nccl', init_method='env://')
-    config.group = torch.distributed.new_group(list(range(config.gpus_num)))
 
     os.makedirs(log_dir, exist_ok=True)
 

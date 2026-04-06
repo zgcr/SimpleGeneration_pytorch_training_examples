@@ -23,7 +23,9 @@ from torch.amp.autocast_mode import autocast
 from SimpleGeneration.image_tokenizer.common import AverageMeter
 
 
-def all_reduce_operation_in_group_for_variables(variables, operator, group):
+def all_reduce_operation_in_group_for_variables(variables,
+                                                operator,
+                                                group=None):
     for i in range(len(variables)):
         if not torch.is_tensor(variables[i]):
             variables[i] = torch.tensor(variables[i]).cuda()
@@ -54,7 +56,7 @@ def train_vqgan_model(train_loader, generator_model, discriminator_model,
     log_info = f'use_amp: {config.use_amp}, amp_type: {config.amp_type}!'
     logger.info(log_info) if local_rank == 0 and total_rank == 0 else None
 
-    iters = len(train_loader.dataset) // config.batch_size
+    iters = len(train_loader)
     iter_index = 1
     assert config.accumulation_steps >= 1, 'illegal accumulation_steps!'
 
@@ -157,8 +159,7 @@ def train_vqgan_model(train_loader, generator_model, discriminator_model,
 
         [skip_batch_flag] = all_reduce_operation_in_group_for_variables(
             variables=[skip_batch_flag],
-            operator=torch.distributed.ReduceOp.SUM,
-            group=config.group)
+            operator=torch.distributed.ReduceOp.SUM)
 
         if skip_batch_flag:
             log_info = f'skip this batch!'
@@ -297,8 +298,7 @@ def train_vqgan_model(train_loader, generator_model, discriminator_model,
 
         [skip_batch_flag] = all_reduce_operation_in_group_for_variables(
             variables=[skip_batch_flag],
-            operator=torch.distributed.ReduceOp.SUM,
-            group=config.group)
+            operator=torch.distributed.ReduceOp.SUM)
 
         if skip_batch_flag:
             log_info = f'skip this batch!'
@@ -367,56 +367,46 @@ def train_vqgan_model(train_loader, generator_model, discriminator_model,
         if iter_index % config.accumulation_steps == 0:
             for key, value in generator_loss_dict.items():
                 [value] = all_reduce_operation_in_group_for_variables(
-                    variables=[value],
-                    operator=torch.distributed.ReduceOp.SUM,
-                    group=config.group)
+                    variables=[value], operator=torch.distributed.ReduceOp.SUM)
                 generator_loss_dict[key] = value / float(config.gpus_num)
 
             for key, value in discriminator_loss_dict.items():
                 [value] = all_reduce_operation_in_group_for_variables(
-                    variables=[value],
-                    operator=torch.distributed.ReduceOp.SUM,
-                    group=config.group)
+                    variables=[value], operator=torch.distributed.ReduceOp.SUM)
                 discriminator_loss_dict[key] = value / float(config.gpus_num)
 
             [codebook_usage] = all_reduce_operation_in_group_for_variables(
                 variables=[codebook_usage],
-                operator=torch.distributed.ReduceOp.SUM,
-                group=config.group)
+                operator=torch.distributed.ReduceOp.SUM)
             codebook_usage = codebook_usage / float(config.gpus_num)
 
             generator_fake = generator_fake.detach().mean()
             [generator_fake] = all_reduce_operation_in_group_for_variables(
                 variables=[generator_fake],
-                operator=torch.distributed.ReduceOp.SUM,
-                group=config.group)
+                operator=torch.distributed.ReduceOp.SUM)
             generator_fake = generator_fake / float(config.gpus_num)
 
             discriminator_real = discriminator_real.detach().mean()
             [discriminator_real] = all_reduce_operation_in_group_for_variables(
                 variables=[discriminator_real],
-                operator=torch.distributed.ReduceOp.SUM,
-                group=config.group)
+                operator=torch.distributed.ReduceOp.SUM)
             discriminator_real = discriminator_real / float(config.gpus_num)
 
             discriminator_fake = discriminator_fake.detach().mean()
             [discriminator_fake] = all_reduce_operation_in_group_for_variables(
                 variables=[discriminator_fake],
-                operator=torch.distributed.ReduceOp.SUM,
-                group=config.group)
+                operator=torch.distributed.ReduceOp.SUM)
             discriminator_fake = discriminator_fake / float(config.gpus_num)
 
             [generator_loss] = all_reduce_operation_in_group_for_variables(
                 variables=[generator_loss],
-                operator=torch.distributed.ReduceOp.SUM,
-                group=config.group)
+                operator=torch.distributed.ReduceOp.SUM)
             generator_loss = generator_loss / float(config.gpus_num)
             generator_losses.update(generator_loss, images.size(0))
 
             [discriminator_loss] = all_reduce_operation_in_group_for_variables(
                 variables=[discriminator_loss],
-                operator=torch.distributed.ReduceOp.SUM,
-                group=config.group)
+                operator=torch.distributed.ReduceOp.SUM)
             discriminator_loss = discriminator_loss / float(config.gpus_num)
             discriminator_losses.update(discriminator_loss, images.size(0))
 
@@ -516,9 +506,13 @@ def train_vqgan_model_deepspeed(train_loader, generator_model,
     log_info = f'use_amp: {config.use_amp}, amp_type: {config.amp_type}!'
     logger.info(log_info) if local_rank == 0 and total_rank == 0 else None
 
-    iters = len(train_loader.dataset) // config.batch_size
+    iters = len(train_loader)
     iter_index = 1
     assert config.accumulation_steps >= 1, 'illegal accumulation_steps!'
+    assert config.accumulation_steps == generator_model.gradient_accumulation_steps(
+    )
+    assert config.accumulation_steps == discriminator_model.gradient_accumulation_steps(
+    )
 
     if config.use_compile:
         generator_model.module._orig_mod.quantize.reset_codebook_used()
@@ -533,17 +527,15 @@ def train_vqgan_model_deepspeed(train_loader, generator_model,
 
         # for generator training
         ########################################################################################
+        reconstruction_images, codebook_usage, codebook_loss_dict = generator_model(
+            images)
+
         if config.use_amp:
             with autocast(device_type="cuda", dtype=config.amp_type):
-                reconstruction_images, codebook_usage, codebook_loss_dict = generator_model(
-                    images)
                 loss_dict = criterion(images,
                                       reconstruction_images,
                                       loss_type='generator_loss')
-
         else:
-            reconstruction_images, codebook_usage, codebook_loss_dict = generator_model(
-                images)
             loss_dict = criterion(images,
                                   reconstruction_images,
                                   loss_type='generator_loss')
@@ -629,56 +621,46 @@ def train_vqgan_model_deepspeed(train_loader, generator_model,
         if iter_index % config.accumulation_steps == 0:
             for key, value in generator_loss_dict.items():
                 [value] = all_reduce_operation_in_group_for_variables(
-                    variables=[value],
-                    operator=torch.distributed.ReduceOp.SUM,
-                    group=config.group)
+                    variables=[value], operator=torch.distributed.ReduceOp.SUM)
                 generator_loss_dict[key] = value / float(config.gpus_num)
 
             for key, value in discriminator_loss_dict.items():
                 [value] = all_reduce_operation_in_group_for_variables(
-                    variables=[value],
-                    operator=torch.distributed.ReduceOp.SUM,
-                    group=config.group)
+                    variables=[value], operator=torch.distributed.ReduceOp.SUM)
                 discriminator_loss_dict[key] = value / float(config.gpus_num)
 
             [codebook_usage] = all_reduce_operation_in_group_for_variables(
                 variables=[codebook_usage],
-                operator=torch.distributed.ReduceOp.SUM,
-                group=config.group)
+                operator=torch.distributed.ReduceOp.SUM)
             codebook_usage = codebook_usage / float(config.gpus_num)
 
             generator_fake = generator_fake.detach().mean()
             [generator_fake] = all_reduce_operation_in_group_for_variables(
                 variables=[generator_fake],
-                operator=torch.distributed.ReduceOp.SUM,
-                group=config.group)
+                operator=torch.distributed.ReduceOp.SUM)
             generator_fake = generator_fake / float(config.gpus_num)
 
             discriminator_real = discriminator_real.detach().mean()
             [discriminator_real] = all_reduce_operation_in_group_for_variables(
                 variables=[discriminator_real],
-                operator=torch.distributed.ReduceOp.SUM,
-                group=config.group)
+                operator=torch.distributed.ReduceOp.SUM)
             discriminator_real = discriminator_real / float(config.gpus_num)
 
             discriminator_fake = discriminator_fake.detach().mean()
             [discriminator_fake] = all_reduce_operation_in_group_for_variables(
                 variables=[discriminator_fake],
-                operator=torch.distributed.ReduceOp.SUM,
-                group=config.group)
+                operator=torch.distributed.ReduceOp.SUM)
             discriminator_fake = discriminator_fake / float(config.gpus_num)
 
             [generator_loss] = all_reduce_operation_in_group_for_variables(
                 variables=[generator_loss],
-                operator=torch.distributed.ReduceOp.SUM,
-                group=config.group)
+                operator=torch.distributed.ReduceOp.SUM)
             generator_loss = generator_loss / float(config.gpus_num)
             generator_losses.update(generator_loss, images.size(0))
 
             [discriminator_loss] = all_reduce_operation_in_group_for_variables(
                 variables=[discriminator_loss],
-                operator=torch.distributed.ReduceOp.SUM,
-                group=config.group)
+                operator=torch.distributed.ReduceOp.SUM)
             discriminator_loss = discriminator_loss / float(config.gpus_num)
             discriminator_losses.update(discriminator_loss, images.size(0))
 
@@ -728,15 +710,16 @@ def train_vqgan_model_deepspeed(train_loader, generator_model,
 
                 # Generator: respect ZeRO stage for parameter gathering
                 if config.deepspeed_zero_stage == 3:
-                    generator_state_dict = {}
-                    for name, param in generator_module.named_parameters():
-                        with deepspeed.zero.GatheredParameters(param):
-                            if local_rank == 0 and total_rank == 0:
-                                generator_state_dict[name] = param.data.cpu(
-                                ).clone()
-                    for name, buf in generator_module.named_buffers():
+                    # Batch gather all parameters at once to reduce
+                    # communication rounds under ZeRO-3
+                    all_params = list(generator_module.parameters())
+                    with deepspeed.zero.GatheredParameters(all_params):
                         if local_rank == 0 and total_rank == 0:
-                            generator_state_dict[name] = buf.cpu().clone()
+                            generator_state_dict = {
+                                k: v.cpu().clone()
+                                for k, v in
+                                generator_module.state_dict().items()
+                            }
                     if local_rank == 0 and total_rank == 0:
                         torch.save(generator_state_dict, generator_save_path)
                 else:
@@ -761,8 +744,9 @@ def train_vqgan_model_deepspeed(train_loader, generator_model,
 def test_vqgan_model(test_loader, generator_model, config):
     # switch to evaluate mode
     generator_model.eval()
+    generator_model.module.quantize.reset_codebook_used()
 
-    mae, psnr, ssim = [], [], []
+    psnr, ssim = [], []
     codebook_usage = 0.
     with torch.no_grad():
         model_on_cuda = next(generator_model.parameters()).is_cuda
@@ -812,17 +796,11 @@ def test_vqgan_model(test_loader, generator_model, config):
                 per_image = per_image.cpu().numpy()
 
                 per_output = per_output.permute(1, 2, 0)
-                # per_image value is between [0, 1]
+                # per_output value is between [0, 1]
                 per_output = (per_output * 0.5 + 0.5)
                 per_output = torch.clamp(per_output, min=0., max=1.0)
                 per_output = per_output.cpu().numpy()
 
-                per_pair_mae = np.sum(
-                    np.abs(
-                        per_image.astype(np.float32) -
-                        per_output.astype(np.float32))) / np.sum(
-                            per_image.astype(np.float32) +
-                            per_output.astype(np.float32))
                 per_pair_psnr = compare_psnr(per_image,
                                              per_output,
                                              data_range=1.0)
@@ -831,16 +809,13 @@ def test_vqgan_model(test_loader, generator_model, config):
                                              data_range=1.0,
                                              channel_axis=-1)
 
-                mae.append(per_pair_mae)
                 psnr.append(per_pair_psnr)
                 ssim.append(per_pair_ssim)
 
-    mae = sum(mae) / len(mae)
     psnr = sum(psnr) / len(psnr)
     ssim = sum(ssim) / len(ssim)
 
     result_dict = {
-        'mae': mae,
         'psnr': psnr,
         'ssim': ssim,
         'codebook_usage': codebook_usage,
@@ -868,7 +843,7 @@ def train_fsq_model(train_loader, model, criterion, optimizer, scheduler,
     log_info = f'use_amp: {config.use_amp}, amp_type: {config.amp_type}!'
     logger.info(log_info) if local_rank == 0 and total_rank == 0 else None
 
-    iters = len(train_loader.dataset) // config.batch_size
+    iters = len(train_loader)
     iter_index = 1
     assert config.accumulation_steps >= 1, 'illegal accumulation_steps!'
 
@@ -955,8 +930,7 @@ def train_fsq_model(train_loader, model, criterion, optimizer, scheduler,
 
         [skip_batch_flag] = all_reduce_operation_in_group_for_variables(
             variables=[skip_batch_flag],
-            operator=torch.distributed.ReduceOp.SUM,
-            group=config.group)
+            operator=torch.distributed.ReduceOp.SUM)
 
         if skip_batch_flag:
             log_info = f'skip this batch!'
@@ -1007,15 +981,11 @@ def train_fsq_model(train_loader, model, criterion, optimizer, scheduler,
         if iter_index % config.accumulation_steps == 0:
             for key, value in loss_dict.items():
                 [value] = all_reduce_operation_in_group_for_variables(
-                    variables=[value],
-                    operator=torch.distributed.ReduceOp.SUM,
-                    group=config.group)
+                    variables=[value], operator=torch.distributed.ReduceOp.SUM)
                 loss_dict[key] = value / float(config.gpus_num)
 
             [loss] = all_reduce_operation_in_group_for_variables(
-                variables=[loss],
-                operator=torch.distributed.ReduceOp.SUM,
-                group=config.group)
+                variables=[loss], operator=torch.distributed.ReduceOp.SUM)
             loss = loss / float(config.gpus_num)
             losses.update(loss, images.size(0))
 
@@ -1025,8 +995,7 @@ def train_fsq_model(train_loader, model, criterion, optimizer, scheduler,
         if iter_index % config.accumulation_steps == 0:
             [codebook_usage] = all_reduce_operation_in_group_for_variables(
                 variables=[codebook_usage],
-                operator=torch.distributed.ReduceOp.SUM,
-                group=config.group)
+                operator=torch.distributed.ReduceOp.SUM)
             codebook_usage = codebook_usage / float(config.gpus_num)
 
         accumulation_iter_index, accumulation_iters = int(
@@ -1085,9 +1054,10 @@ def train_fsq_model_deepspeed(train_loader, model, criterion, optimizer,
     log_info = f'use_amp: {config.use_amp}, amp_type: {config.amp_type}!'
     logger.info(log_info) if local_rank == 0 and total_rank == 0 else None
 
-    iters = len(train_loader.dataset) // config.batch_size
+    iters = len(train_loader)
     iter_index = 1
     assert config.accumulation_steps >= 1, 'illegal accumulation_steps!'
+    assert config.accumulation_steps == model.gradient_accumulation_steps()
 
     if config.use_compile:
         model.module._orig_mod.quantize.reset_codebook_used()
@@ -1123,15 +1093,11 @@ def train_fsq_model_deepspeed(train_loader, model, criterion, optimizer,
         if iter_index % config.accumulation_steps == 0:
             for key, value in loss_dict.items():
                 [value] = all_reduce_operation_in_group_for_variables(
-                    variables=[value],
-                    operator=torch.distributed.ReduceOp.SUM,
-                    group=config.group)
+                    variables=[value], operator=torch.distributed.ReduceOp.SUM)
                 loss_dict[key] = value / float(config.gpus_num)
 
             [loss] = all_reduce_operation_in_group_for_variables(
-                variables=[loss],
-                operator=torch.distributed.ReduceOp.SUM,
-                group=config.group)
+                variables=[loss], operator=torch.distributed.ReduceOp.SUM)
             loss = loss / float(config.gpus_num)
             losses.update(loss, images.size(0))
 
@@ -1141,8 +1107,7 @@ def train_fsq_model_deepspeed(train_loader, model, criterion, optimizer,
         if iter_index % config.accumulation_steps == 0:
             [codebook_usage] = all_reduce_operation_in_group_for_variables(
                 variables=[codebook_usage],
-                operator=torch.distributed.ReduceOp.SUM,
-                group=config.group)
+                operator=torch.distributed.ReduceOp.SUM)
             codebook_usage = codebook_usage / float(config.gpus_num)
 
         accumulation_iter_index, accumulation_iters = int(
@@ -1171,14 +1136,15 @@ def train_fsq_model_deepspeed(train_loader, model, criterion, optimizer,
                     f'step_{total_accumulation_iters}.pth')
 
                 if config.deepspeed_zero_stage == 3:
-                    state_dict = {}
-                    for name, param in module.named_parameters():
-                        with deepspeed.zero.GatheredParameters(param):
-                            if local_rank == 0 and total_rank == 0:
-                                state_dict[name] = param.data.cpu().clone()
-                    for name, buf in module.named_buffers():
+                    # Batch gather all parameters at once to reduce
+                    # communication rounds under ZeRO-3
+                    all_params = list(module.parameters())
+                    with deepspeed.zero.GatheredParameters(all_params):
                         if local_rank == 0 and total_rank == 0:
-                            state_dict[name] = buf.cpu().clone()
+                            state_dict = {
+                                k: v.cpu().clone()
+                                for k, v in module.state_dict().items()
+                            }
                     if local_rank == 0 and total_rank == 0:
                         torch.save(state_dict, save_path)
                 else:
@@ -1195,8 +1161,9 @@ def train_fsq_model_deepspeed(train_loader, model, criterion, optimizer,
 def test_fsq_model(test_loader, model, config):
     # switch to evaluate mode
     model.eval()
+    model.module.quantize.reset_codebook_used()
 
-    mae, psnr, ssim = [], [], []
+    psnr, ssim = [], []
     codebook_usage = 0.
     with torch.no_grad():
         model_on_cuda = next(model.parameters()).is_cuda
@@ -1237,17 +1204,11 @@ def test_fsq_model(test_loader, model, config):
                 per_image = per_image.cpu().numpy()
 
                 per_output = per_output.permute(1, 2, 0)
-                # per_image value is between [0, 1]
+                # per_output value is between [0, 1]
                 per_output = (per_output * 0.5 + 0.5)
                 per_output = torch.clamp(per_output, min=0., max=1.0)
                 per_output = per_output.cpu().numpy()
 
-                per_pair_mae = np.sum(
-                    np.abs(
-                        per_image.astype(np.float32) -
-                        per_output.astype(np.float32))) / np.sum(
-                            per_image.astype(np.float32) +
-                            per_output.astype(np.float32))
                 per_pair_psnr = compare_psnr(per_image,
                                              per_output,
                                              data_range=1.0)
@@ -1256,16 +1217,13 @@ def test_fsq_model(test_loader, model, config):
                                              data_range=1.0,
                                              channel_axis=-1)
 
-                mae.append(per_pair_mae)
                 psnr.append(per_pair_psnr)
                 ssim.append(per_pair_ssim)
 
-    mae = sum(mae) / len(mae)
     psnr = sum(psnr) / len(psnr)
     ssim = sum(ssim) / len(ssim)
 
     result_dict = {
-        'mae': mae,
         'psnr': psnr,
         'ssim': ssim,
         'codebook_usage': codebook_usage,
