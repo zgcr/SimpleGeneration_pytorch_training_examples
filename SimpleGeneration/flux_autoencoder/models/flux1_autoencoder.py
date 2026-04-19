@@ -413,6 +413,7 @@ class DiagonalGaussian(nn.Module):
 
     def kl(self, z):
         mean, logvar = torch.chunk(z, 2, dim=self.chunk_dim)
+        logvar = torch.clamp(logvar, -30.0, 20.0)
 
         var = torch.exp(logvar)
 

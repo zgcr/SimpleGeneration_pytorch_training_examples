@@ -45,8 +45,13 @@ def build_param_groups(config, model):
                 continue
             all_params.append(param)
             # DeepSpeed 0.18.9 engine.py requires `param.use_muon`
-            # attribute on every parameter. Set it based on ndim >= 2.
-            if param.ndim >= 2:
+            # attribute on every parameter. Must match the logic in
+            # deepspeed.set_optimizer_flags() (called inside
+            # deepspeed.initialize()) which excludes params whose name
+            # contains "embed" or "lm_head".
+            if param.ndim >= 2 and not any(
+                    keyword in name.lower()
+                    for keyword in ("embed", "lm_head")):
                 param.use_muon = True
                 muon_param_names.append(name)
             else:
@@ -432,15 +437,6 @@ def build_deepspeed_config(config):
         # ZeRO-3下每个rank只持有1/N参数分片,直接state_dict()只能拿到本rank的模型分片参数。开启此选项后,调用model_engine.save_checkpoint()时DeepSpeed 会自动执行all-gather将完整的16-bit权重收集到一起保存
         ds_config["zero_optimization"][
             "stage3_gather_16bit_weights_on_model_save"] = True
-
-    ds_config["flops_profiler"] = {
-        "enabled": True,
-        "profile_step": 1,  # 在第1个step进行profiling
-        "module_depth": -1,  # -1表示打印所有层级
-        "top_modules": 3,  # 打印top 3模块
-        "detailed": True,  # 打印详细信息
-        "output_file": None,  # None表示输出到DeepSpeed log(终端/日志)
-    }
 
     # Optimizer (let DeepSpeed create the optimizer natively for ZeRO
     # compatibility, especially for Muon which requires native support

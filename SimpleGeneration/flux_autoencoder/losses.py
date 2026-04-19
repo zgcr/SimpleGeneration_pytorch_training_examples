@@ -159,7 +159,7 @@ class ReconstructionL1Loss(nn.Module):
 
     def __init__(self):
         super(ReconstructionL1Loss, self).__init__()
-        self.loss = nn.L1Loss(reduction='mean')
+        self.loss = nn.L1Loss(reduction='none')
 
     def forward(self, inputs, preds):
         inputs = inputs.float()
@@ -174,7 +174,7 @@ class ReconstructionL2Loss(nn.Module):
 
     def __init__(self):
         super(ReconstructionL2Loss, self).__init__()
-        self.loss = nn.MSELoss(reduction='mean')
+        self.loss = nn.MSELoss(reduction='none')
 
     def forward(self, inputs, preds):
         inputs = inputs.float()
@@ -196,7 +196,6 @@ class PerceptualLoss(nn.Module):
         preds = preds.float()
 
         loss = self.loss(inputs, preds)
-        loss = loss.mean()
 
         return loss
 
@@ -283,16 +282,23 @@ class FLUX1AELoss(nn.Module):
         reconstruction_images = reconstruction_images.float()
 
         if loss_type == 'generator_loss':
+            # per-element L1 loss: (B, C, H, W)
             reconstruction_loss = self.reconstruction_loss(
                 images, reconstruction_images)
             reconstruction_loss = self.reconstruction_weight * reconstruction_loss
 
+            # LPIPS loss: (B, 1, 1, 1), broadcasts to (B, C, H, W)
             perceptual_loss = self.perceptual_loss(images,
                                                    reconstruction_images)
             perceptual_loss = self.perceptual_weight * perceptual_loss
 
-            nll_loss = reconstruction_loss + perceptual_loss
-            nll_loss = nll_loss / torch.exp(logvar) + logvar
+            # per-element combined loss: (B, C, H, W)
+            rec_loss = reconstruction_loss + perceptual_loss
+
+            # per-element logvar scaling: (B, C, H, W)
+            nll_loss = rec_loss / torch.exp(logvar) + logvar
+            # sum over C,H,W then mean over batch (consistent with reference)
+            nll_loss = torch.sum(nll_loss) / nll_loss.shape[0]
 
             kl_loss = torch.mean(kl_out)
             kl_loss = self.kl_weight * kl_loss
@@ -320,7 +326,6 @@ class FLUX1AELoss(nn.Module):
 
             discriminator_adversarial_loss = self.discriminator_adversarial_loss(
                 discriminator_real, discriminator_fake)
-            discriminator_adversarial_loss = self.discriminator_weight * discriminator_adversarial_loss
 
             loss_dict = {
                 'discriminator_adversarial_loss':

@@ -2,6 +2,7 @@
 __pycache__
 checkpoints
 log
+*__pycache__*
 *checkpoints*
 *log*
 *temp*
@@ -10,5 +11,6 @@ log
 *.pt
 *.log
 *.csv
+*.pyc
 .ipynb_checkpoints
 .gradio

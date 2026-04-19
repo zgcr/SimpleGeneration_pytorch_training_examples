@@ -6,8 +6,8 @@ opencv_python
 scipy
 scikit-image
 tqdm
-transformers
 yapf
 gpustat
 calflops
+transformers==5.5.0
 deepspeed==0.18.9

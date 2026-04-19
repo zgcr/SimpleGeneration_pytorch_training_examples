@@ -79,6 +79,8 @@ class config:
         'AdamW',
         {
             'lr': 1e-4,
+            'beta1': 0.5,
+            'beta2': 0.9,
             'global_weight_decay': False,
             # if global_weight_decay = False
             # all bias, bn and other 1d params weight set to 0 weight decay
@@ -100,6 +102,8 @@ class config:
         'AdamW',
         {
             'lr': 1e-4,
+            'beta1': 0.5,
+            'beta2': 0.9,
             'global_weight_decay': False,
             # if global_weight_decay = False
             # all bias, bn and other 1d params weight set to 0 weight decay

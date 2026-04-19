@@ -155,6 +155,13 @@ def train_flux_autoencoder_model(train_loader, generator_model,
         for key, value in generator_loss_dict.items():
             generator_loss_dict[key] = value / config.accumulation_steps
 
+        # Freeze discriminator params before generator backward to prevent
+        # discriminator parameters from accumulating spurious gradients
+        # from the generator's adversarial loss backward pass.
+        # This is critical when accumulation_steps > 1.
+        for param in discriminator_model.parameters():
+            param.requires_grad = False
+
         if config.use_amp:
             config.generator_scaler.scale(generator_loss).backward()
         else:
@@ -235,6 +242,10 @@ def train_flux_autoencoder_model(train_loader, generator_model,
                             config.generator_clip_max_norm)
 
                 generator_optimizer.step()
+
+        # Unfreeze discriminator params for discriminator training
+        for param in discriminator_model.parameters():
+            param.requires_grad = True
 
         ########################################################################################
         # for discriminator training
