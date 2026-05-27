@@ -14,4 +14,3 @@ log
 *.pyc
 .ipynb_checkpoints
 .gradio
-SimpleGeneration/universal_image_edit

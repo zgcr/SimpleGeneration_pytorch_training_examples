@@ -1,0 +1,6 @@
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun  \
+    --nproc_per_node=8 \
+    --master_addr 127.0.1.11 \
+    --master_port 10001 \
+    ../../../tools/train_flux_autoencoder_model_multi_node_nas.py \
+    --work-dir ./
