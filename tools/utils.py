@@ -248,7 +248,6 @@ class DeepSpeedEmaModel:
         module = model_engine.module._orig_mod if self.use_compile else model_engine.module
 
         if self.zero_stage == 3:
-            import deepspeed
             ema_full_state_dict = {}
             world_size = torch.distributed.get_world_size()
 
