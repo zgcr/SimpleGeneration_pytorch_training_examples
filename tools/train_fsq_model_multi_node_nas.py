@@ -145,7 +145,7 @@ def main():
                 log_info) if local_rank == 0 and total_rank == 0 else None
 
     scheduler = Scheduler(config, optimizer)
-    model, _, config.scaler = build_training_mode(config, model)
+    model, config.ema_model, config.scaler = build_training_mode(config, model)
 
     start_epoch, train_time = 1, 0
     best_loss, train_loss = 1e9, 0
@@ -168,15 +168,20 @@ def main():
         log_info = f'resuming model from {resume_model}. resume_epoch: {saved_epoch:0>3d}, used_time: {used_time:.3f} hours, best_loss: {best_loss:.4f}, lr: {lr:.6f}'
         logger.info(log_info) if local_rank == 0 and total_rank == 0 else None
 
+        if 'ema_model_state_dict' in checkpoint.keys():
+            config.ema_model.ema_model.load_state_dict(
+                checkpoint['ema_model_state_dict'])
+            config.ema_model.updates = checkpoint['ema_model_updates']
+
     # use torch 2.0 compile function
     config.compile_support = False
     log_info = f'using torch version:{torch.__version__}'
     logger.info(log_info) if local_rank == 0 and total_rank == 0 else None
-    if re.match(r'2.\d*.\d*', torch.__version__):
+    if re.match(r'2\.\d+\.\d+', torch.__version__):
         config.compile_support = True
         log_info = f'this torch version support torch.compile function.'
         logger.info(log_info) if local_rank == 0 and total_rank == 0 else None
-    elif re.match(r'1.\d*.\d*', torch.__version__):
+    elif re.match(r'1\.\d+\.\d+', torch.__version__):
         log_info = f'this torch version unsupport torch.compile function.'
         logger.info(log_info) if local_rank == 0 and total_rank == 0 else None
     else:
@@ -208,9 +213,11 @@ def main():
 
         train_time += (time.time() - per_epoch_start_time) / 3600
 
-        if epoch % config.save_interval == 0:
+        if epoch % config.save_interval == 0 or epoch == config.epochs:
             if local_rank == 0 and total_rank == 0:
-                if config.use_compile:
+                if config.use_ema_model:
+                    save_model = config.ema_model.ema_model.module.state_dict()
+                elif config.use_compile:
                     save_model = model._orig_mod.module.state_dict()
                 else:
                     save_model = model.module.state_dict()
@@ -222,7 +229,10 @@ def main():
             # save best acc1 model and each epoch checkpoint
             if train_loss < best_loss:
                 best_loss = train_loss
-                if config.use_compile:
+                if config.use_ema_model:
+                    save_best_model = config.ema_model.ema_model.module.state_dict(
+                    )
+                elif config.use_compile:
                     save_best_model = model._orig_mod.module.state_dict()
                 else:
                     save_best_model = model.module.state_dict()
@@ -235,17 +245,42 @@ def main():
             else:
                 save_checkpoint_model = model.state_dict()
 
-            torch.save(
-                {
-                    'epoch': epoch,
-                    'time': train_time,
-                    'best_loss': best_loss,
-                    'train_loss': train_loss,
-                    'lr': scheduler.current_lr,
-                    'model_state_dict': save_checkpoint_model,
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                }, os.path.join(checkpoint_dir, 'latest.pth'))
+            if config.use_ema_model:
+                torch.save(
+                    {
+                        'epoch':
+                        epoch,
+                        'time':
+                        train_time,
+                        'best_loss':
+                        best_loss,
+                        'train_loss':
+                        train_loss,
+                        'lr':
+                        scheduler.current_lr,
+                        'model_state_dict':
+                        save_checkpoint_model,
+                        'ema_model_state_dict':
+                        config.ema_model.ema_model.state_dict(),
+                        'ema_model_updates':
+                        config.ema_model.updates,
+                        'optimizer_state_dict':
+                        optimizer.state_dict(),
+                        'scheduler_state_dict':
+                        scheduler.state_dict(),
+                    }, os.path.join(checkpoint_dir, 'latest.pth'))
+            else:
+                torch.save(
+                    {
+                        'epoch': epoch,
+                        'time': train_time,
+                        'best_loss': best_loss,
+                        'train_loss': train_loss,
+                        'lr': scheduler.current_lr,
+                        'model_state_dict': save_checkpoint_model,
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                    }, os.path.join(checkpoint_dir, 'latest.pth'))
 
         log_info = f'until epoch: {epoch:0>3d}, best_loss: {best_loss:.4f}'
         logger.info(log_info) if local_rank == 0 and total_rank == 0 else None

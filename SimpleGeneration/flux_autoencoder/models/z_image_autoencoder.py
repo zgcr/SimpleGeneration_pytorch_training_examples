@@ -87,7 +87,7 @@ class ResnetBlock(nn.Module):
                                           padding=0,
                                           bias=True)
 
-        self.silu = nn.SiLU(inplace=True)
+        self.silu = nn.SiLU()
 
     def forward(self, x):
         h = x
@@ -225,7 +225,7 @@ class Encoder(nn.Module):
                                   padding=1,
                                   bias=True)
 
-        self.silu = nn.SiLU(inplace=True)
+        self.silu = nn.SiLU()
 
     def forward(self, x):
         hs = [self.conv_in(x)]
@@ -346,7 +346,7 @@ class Decoder(nn.Module):
                                   padding=1,
                                   bias=True)
 
-        self.silu = nn.SiLU(inplace=True)
+        self.silu = nn.SiLU()
 
     def forward(self, z):
         # z to block_in

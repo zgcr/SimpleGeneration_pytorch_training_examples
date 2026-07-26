@@ -258,6 +258,7 @@ class Encoder(nn.Module):
                         h = self.down[level_idx].attn[i_block](h)
 
                 hs.append(h)
+
             if level_idx != self.stage_num - 1:
                 if self.use_gradient_checkpoint:
                     h = checkpoint(self.down[level_idx].downsample,

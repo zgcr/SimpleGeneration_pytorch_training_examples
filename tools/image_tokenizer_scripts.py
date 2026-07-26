@@ -414,6 +414,10 @@ def train_vqgan_model(train_loader, generator_model, discriminator_model,
             total_losses.update(total_loss, images.size(0))
 
         if iter_index % config.accumulation_steps == 0:
+            if config.use_ema_model:
+                config.generator_ema_model.update(generator_model)
+                config.discriminator_ema_model.update(discriminator_model)
+
             generator_scheduler.step(generator_optimizer,
                                      iter_index / iters + (epoch - 1))
             discriminator_scheduler.step(discriminator_optimizer,
@@ -441,7 +445,12 @@ def train_vqgan_model(train_loader, generator_model, discriminator_model,
                    'use_step_save_interval') and config.use_step_save_interval:
             if total_accumulation_iters % config.step_save_interval == 0:
                 if local_rank == 0 and total_rank == 0:
-                    if config.use_compile:
+                    if config.use_ema_model:
+                        save_generator_model = config.generator_ema_model.ema_model.module.state_dict(
+                        )
+                        save_discriminator_model = config.discriminator_ema_model.ema_model.module.state_dict(
+                        )
+                    elif config.use_compile:
                         save_generator_model = generator_model._orig_mod.module.state_dict(
                         )
                         save_discriminator_model = discriminator_model._orig_mod.module.state_dict(
@@ -668,6 +677,10 @@ def train_vqgan_model_deepspeed(train_loader, generator_model,
             total_losses.update(total_loss, images.size(0))
 
         if iter_index % config.accumulation_steps == 0:
+            if config.use_ema_model:
+                config.generator_ema_model.update(generator_model)
+                config.discriminator_ema_model.update(discriminator_model)
+
             generator_scheduler.step(generator_optimizer,
                                      iter_index / iters + (epoch - 1))
             discriminator_scheduler.step(discriminator_optimizer,
@@ -694,13 +707,6 @@ def train_vqgan_model_deepspeed(train_loader, generator_model,
         if hasattr(config,
                    'use_step_save_interval') and config.use_step_save_interval:
             if total_accumulation_iters % config.step_save_interval == 0:
-                if config.use_compile:
-                    generator_module = generator_model.module._orig_mod
-                    discriminator_module = discriminator_model.module._orig_mod
-                else:
-                    generator_module = generator_model.module
-                    discriminator_module = discriminator_model.module
-
                 generator_save_path = os.path.join(
                     config.checkpoint_dir,
                     f'step_{total_accumulation_iters}_generator_model.pth')
@@ -708,29 +714,54 @@ def train_vqgan_model_deepspeed(train_loader, generator_model,
                     config.checkpoint_dir,
                     f'step_{total_accumulation_iters}_discriminator_model.pth')
 
-                # Generator: respect ZeRO stage for parameter gathering
-                if config.deepspeed_zero_stage == 3:
-                    # Batch gather all parameters at once to reduce
-                    # communication rounds under ZeRO-3
-                    all_params = list(generator_module.parameters())
-                    with deepspeed.zero.GatheredParameters(all_params):
-                        if local_rank == 0 and total_rank == 0:
-                            generator_state_dict = {
-                                k: v.cpu().clone()
-                                for k, v in
-                                generator_module.state_dict().items()
-                            }
+                if config.use_ema_model:
+                    # EMA enabled: save EMA model weights
+                    # For generator: For ZeRO-3, get_ema_model_state_dict
+                    # uses all_gather (collective op), so all ranks must
+                    # call it.
+                    save_generator_model = config.generator_ema_model.get_ema_model_state_dict(
+                        generator_model)
                     if local_rank == 0 and total_rank == 0:
-                        torch.save(generator_state_dict, generator_save_path)
+                        torch.save(save_generator_model, generator_save_path)
+                    # For discriminator: always ZeRO Stage 0
+                    save_discriminator_model = config.discriminator_ema_model.get_ema_model_state_dict(
+                        discriminator_model)
+                    if local_rank == 0 and total_rank == 0:
+                        torch.save(save_discriminator_model,
+                                   discriminator_save_path)
                 else:
-                    if local_rank == 0 and total_rank == 0:
-                        torch.save(generator_module.state_dict(),
-                                   generator_save_path)
+                    # EMA disabled: save training model
+                    if config.use_compile:
+                        generator_module = generator_model.module._orig_mod
+                        discriminator_module = discriminator_model.module._orig_mod
+                    else:
+                        generator_module = generator_model.module
+                        discriminator_module = discriminator_model.module
 
-                # Discriminator: always ZeRO Stage 0, no parameter partitioning
-                if local_rank == 0 and total_rank == 0:
-                    torch.save(discriminator_module.state_dict(),
-                               discriminator_save_path)
+                    # Generator: respect ZeRO stage for parameter gathering
+                    if config.deepspeed_zero_stage == 3:
+                        # Batch gather all parameters at once to reduce
+                        # communication rounds under ZeRO-3
+                        all_params = list(generator_module.parameters())
+                        with deepspeed.zero.GatheredParameters(all_params):
+                            if local_rank == 0 and total_rank == 0:
+                                generator_state_dict = {
+                                    k: v.cpu().clone()
+                                    for k, v in
+                                    generator_module.state_dict().items()
+                                }
+                        if local_rank == 0 and total_rank == 0:
+                            torch.save(generator_state_dict,
+                                       generator_save_path)
+                    else:
+                        if local_rank == 0 and total_rank == 0:
+                            torch.save(generator_module.state_dict(),
+                                       generator_save_path)
+
+                    # Discriminator: always ZeRO Stage 0, no parameter partitioning
+                    if local_rank == 0 and total_rank == 0:
+                        torch.save(discriminator_module.state_dict(),
+                                   discriminator_save_path)
 
         iter_index += 1
 
@@ -990,6 +1021,10 @@ def train_fsq_model(train_loader, model, criterion, optimizer, scheduler,
             losses.update(loss, images.size(0))
 
         if iter_index % config.accumulation_steps == 0:
+            if config.use_ema_model:
+                config.ema_model.update(model)
+
+        if iter_index % config.accumulation_steps == 0:
             scheduler.step(optimizer, iter_index / iters + (epoch - 1))
 
         if iter_index % config.accumulation_steps == 0:
@@ -1015,7 +1050,10 @@ def train_fsq_model(train_loader, model, criterion, optimizer, scheduler,
                    'use_step_save_interval') and config.use_step_save_interval:
             if total_accumulation_iters % config.step_save_interval == 0:
                 if local_rank == 0 and total_rank == 0:
-                    if config.use_compile:
+                    if config.use_ema_model:
+                        save_model = config.ema_model.ema_model.module.state_dict(
+                        )
+                    elif config.use_compile:
                         save_model = model._orig_mod.module.state_dict()
                     else:
                         save_model = model.module.state_dict()
@@ -1091,6 +1129,10 @@ def train_fsq_model_deepspeed(train_loader, model, criterion, optimizer,
         model.step()
 
         if iter_index % config.accumulation_steps == 0:
+            if config.use_ema_model:
+                config.ema_model.update(model)
+
+        if iter_index % config.accumulation_steps == 0:
             for key, value in loss_dict.items():
                 [value] = all_reduce_operation_in_group_for_variables(
                     variables=[value], operator=torch.distributed.ReduceOp.SUM)
@@ -1126,30 +1168,40 @@ def train_fsq_model_deepspeed(train_loader, model, criterion, optimizer,
         if hasattr(config,
                    'use_step_save_interval') and config.use_step_save_interval:
             if total_accumulation_iters % config.step_save_interval == 0:
-                if config.use_compile:
-                    module = model.module._orig_mod
-                else:
-                    module = model.module
-
                 save_path = os.path.join(
                     config.checkpoint_dir,
                     f'step_{total_accumulation_iters}.pth')
 
-                if config.deepspeed_zero_stage == 3:
-                    # Batch gather all parameters at once to reduce
-                    # communication rounds under ZeRO-3
-                    all_params = list(module.parameters())
-                    with deepspeed.zero.GatheredParameters(all_params):
-                        if local_rank == 0 and total_rank == 0:
-                            state_dict = {
-                                k: v.cpu().clone()
-                                for k, v in module.state_dict().items()
-                            }
+                if config.use_ema_model:
+                    # EMA enabled: save EMA model weights
+                    # For ZeRO-3, get_ema_model_state_dict uses all_gather
+                    # (collective op), so all ranks must call it.
+                    save_model = config.ema_model.get_ema_model_state_dict(
+                        model)
                     if local_rank == 0 and total_rank == 0:
-                        torch.save(state_dict, save_path)
+                        torch.save(save_model, save_path)
                 else:
-                    if local_rank == 0 and total_rank == 0:
-                        torch.save(module.state_dict(), save_path)
+                    # EMA disabled: save training model
+                    if config.use_compile:
+                        module = model.module._orig_mod
+                    else:
+                        module = model.module
+
+                    if config.deepspeed_zero_stage == 3:
+                        # Batch gather all parameters at once to reduce
+                        # communication rounds under ZeRO-3
+                        all_params = list(module.parameters())
+                        with deepspeed.zero.GatheredParameters(all_params):
+                            if local_rank == 0 and total_rank == 0:
+                                state_dict = {
+                                    k: v.cpu().clone()
+                                    for k, v in module.state_dict().items()
+                                }
+                        if local_rank == 0 and total_rank == 0:
+                            torch.save(state_dict, save_path)
+                    else:
+                        if local_rank == 0 and total_rank == 0:
+                            torch.save(module.state_dict(), save_path)
 
         iter_index += 1
 

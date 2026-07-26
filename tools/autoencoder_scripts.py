@@ -431,6 +431,10 @@ def train_flux_autoencoder_model(train_loader, generator_model,
             total_losses.update(total_loss, images.size(0))
 
         if iter_index % config.accumulation_steps == 0:
+            if config.use_ema_model:
+                config.generator_ema_model.update(generator_model)
+                config.discriminator_ema_model.update(discriminator_model)
+
             generator_scheduler.step(generator_optimizer,
                                      iter_index / iters + (epoch - 1))
             discriminator_scheduler.step(discriminator_optimizer,
@@ -458,7 +462,12 @@ def train_flux_autoencoder_model(train_loader, generator_model,
                    'use_step_save_interval') and config.use_step_save_interval:
             if total_accumulation_iters % config.step_save_interval == 0:
                 if local_rank == 0 and total_rank == 0:
-                    if config.use_compile:
+                    if config.use_ema_model:
+                        save_generator_model = config.generator_ema_model.ema_model.module.state_dict(
+                        )
+                        save_discriminator_model = config.discriminator_ema_model.ema_model.module.state_dict(
+                        )
+                    elif config.use_compile:
                         save_generator_model = generator_model._orig_mod.module.state_dict(
                         )
                         save_discriminator_model = discriminator_model._orig_mod.module.state_dict(
@@ -706,6 +715,10 @@ def train_flux_autoencoder_model_deepspeed(
             total_losses.update(total_loss, images.size(0))
 
         if iter_index % config.accumulation_steps == 0:
+            if config.use_ema_model:
+                config.generator_ema_model.update(generator_model)
+                config.discriminator_ema_model.update(discriminator_model)
+
             generator_scheduler.step(generator_optimizer,
                                      iter_index / iters + (epoch - 1))
             discriminator_scheduler.step(discriminator_optimizer,
@@ -746,29 +759,45 @@ def train_flux_autoencoder_model_deepspeed(
                     config.checkpoint_dir,
                     f'step_{total_accumulation_iters}_discriminator_model.pth')
 
-                # Generator: respect ZeRO stage for parameter gathering
-                if config.deepspeed_zero_stage == 3:
-                    # Batch gather all parameters at once to reduce
-                    # communication rounds under ZeRO-3
-                    all_params = list(generator_module.parameters())
-                    with deepspeed.zero.GatheredParameters(all_params):
-                        if local_rank == 0 and total_rank == 0:
-                            generator_state_dict = {
-                                k: v.cpu().clone()
-                                for k, v in
-                                generator_module.state_dict().items()
-                            }
+                if config.use_ema_model:
+                    # EMA enabled: save EMA model weights
+                    # For generator: For ZeRO-3, get_ema_model_state_dict
+                    # uses all_gather (collective op), so all ranks must
+                    # call it.
+                    save_generator_model = config.generator_ema_model.get_ema_model_state_dict(
+                        generator_model)
+                    # For discriminator: always ZeRO Stage 0
+                    save_discriminator_model = config.discriminator_ema_model.get_ema_model_state_dict(
+                        discriminator_model)
                     if local_rank == 0 and total_rank == 0:
-                        torch.save(generator_state_dict, generator_save_path)
+                        torch.save(save_generator_model, generator_save_path)
+                        torch.save(save_discriminator_model,
+                                   discriminator_save_path)
                 else:
-                    if local_rank == 0 and total_rank == 0:
-                        torch.save(generator_module.state_dict(),
-                                   generator_save_path)
+                    # Generator: respect ZeRO stage for parameter gathering
+                    if config.deepspeed_zero_stage == 3:
+                        # Batch gather all parameters at once to reduce
+                        # communication rounds under ZeRO-3
+                        all_params = list(generator_module.parameters())
+                        with deepspeed.zero.GatheredParameters(all_params):
+                            if local_rank == 0 and total_rank == 0:
+                                generator_state_dict = {
+                                    k: v.cpu().clone()
+                                    for k, v in
+                                    generator_module.state_dict().items()
+                                }
+                        if local_rank == 0 and total_rank == 0:
+                            torch.save(generator_state_dict,
+                                       generator_save_path)
+                    else:
+                        if local_rank == 0 and total_rank == 0:
+                            torch.save(generator_module.state_dict(),
+                                       generator_save_path)
 
-                # Discriminator: always ZeRO Stage 0, no parameter partitioning
-                if local_rank == 0 and total_rank == 0:
-                    torch.save(discriminator_module.state_dict(),
-                               discriminator_save_path)
+                    # Discriminator: always ZeRO Stage 0, no parameter partitioning
+                    if local_rank == 0 and total_rank == 0:
+                        torch.save(discriminator_module.state_dict(),
+                                   discriminator_save_path)
 
         iter_index += 1
 

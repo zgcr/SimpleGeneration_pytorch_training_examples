@@ -281,6 +281,12 @@ class FLUX1AELoss(nn.Module):
         images = images.float()
         reconstruction_images = reconstruction_images.float()
 
+        # Align discriminator buffer dtypes (e.g. BatchNorm running_mean/running_var)
+        # with parameter dtype to avoid dtype mismatch under DeepSpeed bf16 mode.
+        discriminator_dtype = next(self.discriminator_model.parameters()).dtype
+        for buf in self.discriminator_model.buffers():
+            buf.data = buf.data.to(discriminator_dtype)
+
         if loss_type == 'generator_loss':
             # per-element L1 loss: (B, C, H, W)
             reconstruction_loss = self.reconstruction_loss(
@@ -303,7 +309,8 @@ class FLUX1AELoss(nn.Module):
             kl_loss = torch.mean(kl_out)
             kl_loss = self.kl_weight * kl_loss
 
-            generator_fake = self.discriminator_model(reconstruction_images)
+            generator_fake = self.discriminator_model(
+                reconstruction_images.to(discriminator_dtype))
             generator_adversarial_loss = self.generator_adversarial_loss(
                 generator_fake)
             generator_adversarial_weight = self.calculate_adaptive_weight(
@@ -320,9 +327,10 @@ class FLUX1AELoss(nn.Module):
             return loss_dict
 
         elif loss_type == 'discriminator_loss':
-            discriminator_real = self.discriminator_model(images.detach())
+            discriminator_real = self.discriminator_model(
+                images.detach().to(discriminator_dtype))
             discriminator_fake = self.discriminator_model(
-                reconstruction_images.detach())
+                reconstruction_images.detach().to(discriminator_dtype))
 
             discriminator_adversarial_loss = self.discriminator_adversarial_loss(
                 discriminator_real, discriminator_fake)

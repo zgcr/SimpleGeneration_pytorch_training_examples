@@ -1,7 +1,13 @@
 """
-Muon Optimizer(based on moonlight Muon and KellerJordan Muon)
-https://github.com/MoonshotAI/Moonlight/blob/master/examples/toy_train.py
-https://github.com/KellerJordan/Muon/blob/master/muon.py
+MuonAdamW - Hybrid Optimizer combining Muon and AdamW
+(based on moonlight Muon and KellerJordan Muon)
+
+Uses Muon (MomentUm Orthogonalized by Newton-schulz) for >=2D parameters,
+and AdamW for remaining parameters (1D, embeddings, etc.).
+
+References:
+    https://github.com/MoonshotAI/Moonlight/blob/master/examples/toy_train.py
+    https://github.com/KellerJordan/Muon/blob/master/muon.py
 """
 import math
 
@@ -58,14 +64,16 @@ def zeropower_via_newtonschulz5(G, steps):
     return X
 
 
-class Muon(Optimizer):
+class MuonAdamW(Optimizer):
     """
-    Muon - MomentUm Orthogonalized by Newton-schulz
+    MuonAdamW - Hybrid optimizer combining Muon and AdamW.
 
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
+    For >=2D parameters (e.g., weight matrices in linear/conv layers), this optimizer uses
+    Muon (MomentUm Orthogonalized by Newton-schulz), which internally runs standard SGD-momentum
+    and then performs an orthogonalization post-processing step, replacing each 2D parameter's
+    update with the nearest orthogonal matrix via a Newton-Schulz iteration (stably run in bfloat16).
+
+    For remaining parameters (1D params like biases/norms, embeddings, etc.), it falls back to AdamW.
 
     Some warnings:
     - We believe this optimizer is unlikely to work well for training with small batch size.
@@ -79,10 +87,8 @@ class Muon(Optimizer):
         ns_steps: The number of Newton-Schulz iterations to run. (6 is probably always enough)
         adamw_params: The parameters to be optimized by AdamW. Any parameters in `muon_params` which are
         {0, 1}-D or are detected as being the embed or lm_head will be optimized by AdamW as well.
-        adamw_lr: The learning rate for the internal AdamW.
         adamw_betas: The betas for the internal AdamW.
         adamw_eps: The epsilon for the internal AdamW.
-        adamw_wd: The weight decay for the internal AdamW.
     """
 
     def __init__(self,
@@ -120,7 +126,7 @@ class Muon(Optimizer):
     def adjust_lr_for_muon(self, lr, param_shape):
         A, B = param_shape[:2]
         # We adjust the learning rate and weight decay based on the size of the parameter matrix
-        # as describted in the paper
+        # as described in the paper
         adjusted_ratio = 0.2 * math.sqrt(max(A, B))
         adjusted_lr = lr * adjusted_ratio
         return adjusted_lr
@@ -211,12 +217,173 @@ class Muon(Optimizer):
                 buf1.lerp_(g, 1 - beta1)
                 buf2.lerp_(g.square(), 1 - beta2)
 
-                g = buf1 / (eps + buf2.sqrt())
-
                 bias_correction1 = 1 - beta1**step
                 bias_correction2 = 1 - beta2**step
-                scale = bias_correction1 / bias_correction2**0.5
+
+                m_hat = buf1 / bias_correction1
+                v_hat = buf2 / bias_correction2
+
+                g = m_hat / (v_hat.sqrt() + eps)
+
                 p.data.mul_(1 - lr * weight_decay)
-                p.data.add_(g, alpha=-lr / scale)
+                p.data.add_(g, alpha=-lr)
+
+        return loss
+
+
+class MuonSGD(Optimizer):
+    """
+    MuonSGD - Hybrid optimizer combining Muon and SGD.
+
+    For >=2D parameters (e.g., weight matrices in linear/conv layers), this optimizer uses
+    Muon (MomentUm Orthogonalized by Newton-schulz), which internally runs standard SGD-momentum
+    and then performs an orthogonalization post-processing step, replacing each 2D parameter's
+    update with the nearest orthogonal matrix via a Newton-Schulz iteration (stably run in bfloat16).
+
+    For remaining parameters (1D params like biases/norms, embeddings, etc.), it falls back to SGD.
+
+    Some warnings:
+    - We believe this optimizer is unlikely to work well for training with small batch size.
+    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
+
+    Arguments:
+        muon_params: The parameters to be optimized by Muon.
+        lr: The learning rate. The updates will have spectral norm of `lr`. (0.02 is a good default)
+        momentum: The momentum used by the internal SGD. (0.95 is a good default)
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        ns_steps: The number of Newton-Schulz iterations to run. (6 is probably always enough)
+        sgd_params: The parameters to be optimized by SGD. Any parameters in `muon_params` which are
+        {0, 1}-D or are detected as being the embed or lm_head will be optimized by SGD as well.
+        sgd_momentum: The momentum for the internal SGD fallback.
+        sgd_nesterov: Whether to use Nesterov-style momentum in the SGD fallback.
+    """
+
+    def __init__(self,
+                 lr=1e-3,
+                 wd=0.1,
+                 muon_params=None,
+                 momentum=0.95,
+                 nesterov=True,
+                 ns_steps=5,
+                 sgd_params=None,
+                 sgd_momentum=0.9,
+                 sgd_nesterov=False):
+        defaults = dict(lr=lr,
+                        wd=wd,
+                        momentum=momentum,
+                        nesterov=nesterov,
+                        ns_steps=ns_steps,
+                        sgd_momentum=sgd_momentum,
+                        sgd_nesterov=sgd_nesterov)
+
+        params = list(muon_params)
+        sgd_params = list(sgd_params) if sgd_params is not None else []
+        params.extend(sgd_params)
+        super().__init__(params, defaults)
+
+        # Sort parameters into those for which we will use Muon, and those for which we will not
+        for p in muon_params:
+            # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
+            assert p.ndim >= 2, f"Muon requires parameters with ndim >= 2, got {p.ndim}"
+            self.state[p]["use_muon"] = True
+        for p in sgd_params:
+            # Do not use Muon for parameters in sgd_params
+            self.state[p]["use_muon"] = False
+
+    def adjust_lr_for_muon(self, lr, param_shape):
+        A, B = param_shape[:2]
+        # We adjust the learning rate and weight decay based on the size of the parameter matrix
+        # as described in the paper
+        adjusted_ratio = 0.2 * math.sqrt(max(A, B))
+        adjusted_lr = lr * adjusted_ratio
+        return adjusted_lr
+
+    def step(self, closure=None):
+        """Perform a single optimization step.
+
+        Args:
+            closure (Callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+
+            ############################
+            #           Muon           #
+            ############################
+
+            params = [p for p in group["params"] if self.state[p]["use_muon"]]
+            lr = group["lr"]
+            wd = group["wd"]
+            momentum = group["momentum"]
+
+            # generate weight updates
+            for p in params:
+                # sanity check
+                g = p.grad
+                if g is None:
+                    continue
+
+                original_shape = g.shape
+
+                if g.ndim > 2:
+                    g = g.view(g.size(0), -1)
+
+                assert g is not None
+
+                # calc update
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+                buf.mul_(momentum).add_(g)
+                if group["nesterov"]:
+                    g = g.add(buf, alpha=momentum)
+                else:
+                    g = buf
+                u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+
+                # scale update
+                adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
+
+                # apply weight decay
+                p.data.mul_(1 - lr * wd)
+
+                # apply update
+                p.data.add_(u.view(original_shape), alpha=-adjusted_lr)
+
+            ############################
+            #       SGD backup         #
+            ############################
+
+            params = [
+                p for p in group["params"] if not self.state[p]["use_muon"]
+            ]
+            lr = group['lr']
+            weight_decay = group["wd"]
+            sgd_momentum = group["sgd_momentum"]
+            sgd_nesterov = group["sgd_nesterov"]
+
+            for p in params:
+                g = p.grad
+                if g is None:
+                    continue
+                p.data.mul_(1 - lr * weight_decay)
+
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+                buf.mul_(sgd_momentum).add_(g)
+                if sgd_nesterov:
+                    g = g.add(buf, alpha=sgd_momentum)
+                else:
+                    g = buf
+
+                p.data.add_(g, alpha=-lr)
 
         return loss

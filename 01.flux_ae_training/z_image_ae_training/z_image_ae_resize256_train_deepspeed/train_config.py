@@ -36,7 +36,7 @@ class config:
                                   use_gradient_checkpoint=True)
 
     # load total pretrained model or not
-    trained_generator_model_path = ''
+    trained_generator_model_path = '/root/autodl-tmp/pretrained_models/z_image_convert_from_pytorch_official_weights/z_image_vae_convert_from_pytorch_official_weight.pth'
     load_state_dict(trained_generator_model_path, generator_model)
 
     discriminator_model = NLayerDiscriminator(inplanes=3,
@@ -76,48 +76,36 @@ class config:
     accumulation_steps = 1
 
     generator_optimizer = (
-        'AdamW',
+        'Muon',
         {
             'lr': 1e-4,
-            'beta1': 0.5,
-            'beta2': 0.9,
-            'global_weight_decay': False,
-            # if global_weight_decay = False
-            # all bias, bn and other 1d params weight set to 0 weight decay
             'weight_decay': 0,
-            'no_weight_decay_layer_name_list': [],
+            'exclude_muon_layer_name_list': [],
         },
     )
 
     generator_scheduler = (
-        'MultiStepLR',
+        'CosineLR',
         {
             'warm_up_epochs': 0,
-            'gamma': 0.1,
-            'milestones': [100],
+            'min_lr': 5e-6,
         },
     )
 
     discriminator_optimizer = (
-        'AdamW',
+        'Muon',
         {
             'lr': 1e-4,
-            'beta1': 0.5,
-            'beta2': 0.9,
-            'global_weight_decay': False,
-            # if global_weight_decay = False
-            # all bias, bn and other 1d params weight set to 0 weight decay
             'weight_decay': 0,
-            'no_weight_decay_layer_name_list': [],
+            'exclude_muon_layer_name_list': [],
         },
     )
 
     discriminator_scheduler = (
-        'MultiStepLR',
+        'CosineLR',
         {
             'warm_up_epochs': 0,
-            'gamma': 0.1,
-            'milestones': [100],
+            'min_lr': 5e-6,
         },
     )
 
@@ -141,7 +129,13 @@ class config:
         'mode': 'default',
     }
 
+    use_ema_model = True
+    generator_ema_model_decay = 0.9999
+    generator_ema_model_tau = 2000
+    discriminator_ema_model_decay = 0.9999
+    discriminator_ema_model_tau = 2000
+
     # ZeRO stage: 0 (equivalent to DDP), 1, 2, 3
-    deepspeed_zero_stage = 0
+    deepspeed_zero_stage = 2
     # ZeRO-Offload: offload optimizer states (and params for stage 3) to CPU
     deepspeed_offload = False

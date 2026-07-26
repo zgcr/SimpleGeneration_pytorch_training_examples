@@ -66,44 +66,36 @@ class config:
     accumulation_steps = 1
 
     generator_optimizer = (
-        'AdamW',
+        'MuonAdamW',
         {
             'lr': 1e-4,
-            'global_weight_decay': False,
-            # if global_weight_decay = False
-            # all bias, bn and other 1d params weight set to 0 weight decay
             'weight_decay': 0,
-            'no_weight_decay_layer_name_list': [],
+            'exclude_muon_layer_name_list': [],
         },
     )
 
     generator_scheduler = (
-        'MultiStepLR',
+        'CosineLR',
         {
             'warm_up_epochs': 0,
-            'gamma': 0.1,
-            'milestones': [100],
+            'min_lr': 5e-6,
         },
     )
 
     discriminator_optimizer = (
-        'AdamW',
+        'MuonAdamW',
         {
             'lr': 1e-4,
-            'global_weight_decay': False,
-            # if global_weight_decay = False
-            # all bias, bn and other 1d params weight set to 0 weight decay
             'weight_decay': 0,
-            'no_weight_decay_layer_name_list': [],
+            'exclude_muon_layer_name_list': [],
         },
     )
 
     discriminator_scheduler = (
-        'MultiStepLR',
+        'CosineLR',
         {
             'warm_up_epochs': 0,
-            'gamma': 0.1,
-            'milestones': [100],
+            'min_lr': 5e-6,
         },
     )
 
@@ -126,3 +118,7 @@ class config:
         # 'max-autotune': optimizes to produce the fastest model, but takes a very long time to compile and may failed.
         'mode': 'default',
     }
+
+    use_ema_model = True
+    ema_model_decay = 0.9999
+    ema_model_tau = 2000

@@ -273,6 +273,10 @@ class VQGANLoss(nn.Module):
 
         discriminator_dtype = next(self.discriminator_model.parameters()).dtype
 
+        # Convert discriminator buffers (e.g. BatchNorm running_mean/running_var) to the same dtype as parameters, avoiding dtype mismatch under DeepSpeed bf16 mode.
+        for buf in self.discriminator_model.buffers():
+            buf.data = buf.data.to(discriminator_dtype)
+
         if loss_type == 'generator_loss':
             reconstruction_loss = self.reconstruction_loss(
                 images, reconstruction_images)
