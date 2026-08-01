@@ -53,4 +53,4 @@ class config:
 
     use_amp = False
     # torch.float16 or torch.bfloat16
-    amp_type = torch.float16
+    amp_type = torch.bfloat16

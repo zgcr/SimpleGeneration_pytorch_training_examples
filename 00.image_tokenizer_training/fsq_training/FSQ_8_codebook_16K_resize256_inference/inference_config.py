@@ -27,7 +27,7 @@ class config:
 
     use_amp = False
     # torch.float16 or torch.bfloat16
-    amp_type = torch.float16
+    amp_type = torch.bfloat16
 
     inference_image_dir = './test_images'
     save_image_dir = './test_images_result'
