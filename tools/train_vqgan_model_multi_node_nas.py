@@ -16,8 +16,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from tools.image_tokenizer_scripts import train_vqgan_model
-from tools.utils import (get_logger, set_seed, worker_seed_init_fn,
-                         build_training_mode)
+from tools.utils import get_logger, set_seed, worker_seed_init_fn, build_training_mode
 
 from tools.muon_optimizer import MuonAdamW, MuonSGD
 
@@ -46,7 +45,7 @@ class Scheduler:
         self.current_lr = self.lr
 
         self.init_param_groups_lr = [
-            param_group['lr'] for param_group in optimizer.param_groups
+            param_group["lr"] for param_group in optimizer.param_groups
         ]
 
         assert self.scheduler_name in ['MultiStepLR', 'CosineLR',
@@ -91,7 +90,7 @@ class Scheduler:
                          (self.epochs - self.warm_up_epochs))**
                         power) * (param_group_init_lr - min_lr) + min_lr
 
-            param_group['lr'] = param_group_current_lr
+            param_group["lr"] = param_group_current_lr
 
         # Update self.current_lr for logging (using the global base lr)
         if self.warm_up_epochs > 0 and epoch < self.warm_up_epochs:
@@ -111,7 +110,14 @@ class Scheduler:
                                    power) * (self.lr - min_lr) + min_lr
 
     def state_dict(self):
-        return {key: value for key, value in self.__dict__.items()}
+        return {
+            'scheduler_name': self.scheduler_name,
+            'warm_up_epochs': self.warm_up_epochs,
+            'epochs': self.epochs,
+            'lr': self.lr,
+            'current_lr': self.current_lr,
+            'init_param_groups_lr': self.init_param_groups_lr,
+        }
 
     def load_state_dict(self, state_dict):
         self.__dict__.update(state_dict)
@@ -249,6 +255,9 @@ def build_optimizer(config, model, model_type):
             'position_encoding',
             'cls_token',
             'patch_embedding',
+            'embed',
+            'lm_head',
+            'merger',
         ]
         if 'exclude_muon_layer_name_list' in optimizer_parameters.keys(
         ) and isinstance(optimizer_parameters['exclude_muon_layer_name_list'],
@@ -263,10 +272,12 @@ def build_optimizer(config, model, model_type):
             if not param.requires_grad:
                 continue
 
-            # Muon is used for 2D parameters that are not in exclude list
+            # Muon is used for 2D parameters that are not in exclude list.
+            # The name is lowercased before matching, exactly like
+            # deepspeed.set_optimizer_flags does.
             use_muon = (
                 param.ndim >= 2
-                and not any(exclude_name in name
+                and not any(exclude_name in name.lower()
                             for exclude_name in exclude_muon_layer_name_list))
 
             if use_muon:
@@ -339,6 +350,9 @@ def build_optimizer(config, model, model_type):
             'position_encoding',
             'cls_token',
             'patch_embedding',
+            'embed',
+            'lm_head',
+            'merger',
         ]
         if 'exclude_muon_layer_name_list' in optimizer_parameters.keys(
         ) and isinstance(optimizer_parameters['exclude_muon_layer_name_list'],
@@ -353,10 +367,12 @@ def build_optimizer(config, model, model_type):
             if not param.requires_grad:
                 continue
 
-            # Muon is used for 2D parameters that are not in exclude list
+            # Muon is used for 2D parameters that are not in exclude list.
+            # The name is lowercased before matching, exactly like
+            # deepspeed.set_optimizer_flags does.
             use_muon = (
                 param.ndim >= 2
-                and not any(exclude_name in name
+                and not any(exclude_name in name.lower()
                             for exclude_name in exclude_muon_layer_name_list))
 
             if use_muon:
@@ -472,7 +488,7 @@ def main():
 
     init_fn = functools.partial(worker_seed_init_fn,
                                 num_workers=num_workers,
-                                local_rank=local_rank,
+                                global_rank=total_rank,
                                 seed=config.seed)
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         config.train_dataset, shuffle=True)

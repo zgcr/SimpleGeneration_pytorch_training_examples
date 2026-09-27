@@ -85,8 +85,11 @@ class MuonAdamW(Optimizer):
         momentum: The momentum used by the internal SGD. (0.95 is a good default)
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iterations to run. (6 is probably always enough)
-        adamw_params: The parameters to be optimized by AdamW. Any parameters in `muon_params` which are
-        {0, 1}-D or are detected as being the embed or lm_head will be optimized by AdamW as well.
+        adamw_params: The parameters to be optimized by AdamW with weight decay. Any parameters in
+        `muon_params` which are {0, 1}-D or are detected as being the embed or lm_head will be
+        optimized by AdamW as well.
+        adamw_nowd_params: The parameters to be optimized by AdamW without weight decay (1d params
+        like norms/biases/LayerScale, and 0d params like logit_scale/logit_bias).
         adamw_betas: The betas for the internal AdamW.
         adamw_eps: The epsilon for the internal AdamW.
     """
@@ -99,6 +102,7 @@ class MuonAdamW(Optimizer):
                  nesterov=True,
                  ns_steps=5,
                  adamw_params=None,
+                 adamw_nowd_params=None,
                  adamw_betas=(0.9, 0.999),
                  adamw_eps=1e-8):
         defaults = dict(lr=lr,
@@ -109,26 +113,35 @@ class MuonAdamW(Optimizer):
                         adamw_betas=adamw_betas,
                         adamw_eps=adamw_eps)
 
-        params = list(muon_params)
+        muon_params = list(muon_params) if muon_params is not None else []
         adamw_params = list(adamw_params) if adamw_params is not None else []
-        params.extend(adamw_params)
-        super().__init__(params, defaults)
+        adamw_nowd_params = list(
+            adamw_nowd_params) if adamw_nowd_params is not None else []
 
-        # Sort parameters into those for which we will use Muon, and those for which we will not
+        param_groups = []
+        if len(muon_params) > 0 or len(adamw_params) > 0:
+            param_groups.append({
+                'params': muon_params + adamw_params,
+                'wd': wd,
+            })
+        if len(adamw_nowd_params) > 0:
+            param_groups.append({
+                'params': adamw_nowd_params,
+                'wd': 0.,
+            })
+        super().__init__(param_groups, defaults)
+
         for p in muon_params:
-            # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
             assert p.ndim >= 2, f"Muon requires parameters with ndim >= 2, got {p.ndim}"
             self.state[p]["use_muon"] = True
-        for p in adamw_params:
-            # Do not use Muon for parameters in adamw_params
+        for p in adamw_params + adamw_nowd_params:
             self.state[p]["use_muon"] = False
 
     def adjust_lr_for_muon(self, lr, param_shape):
         A, B = param_shape[:2]
-        # We adjust the learning rate and weight decay based on the size of the parameter matrix
-        # as described in the paper
         adjusted_ratio = 0.2 * math.sqrt(max(A, B))
         adjusted_lr = lr * adjusted_ratio
+
         return adjusted_lr
 
     def step(self, closure=None):
@@ -183,10 +196,9 @@ class MuonAdamW(Optimizer):
                 # scale update
                 adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
 
-                # apply weight decay
-                p.data.mul_(1 - lr * wd)
+                if wd != 0:
+                    p.data.mul_(1 - lr * wd)
 
-                # apply update
                 p.data.add_(u.view(original_shape), alpha=-adjusted_lr)
 
             ############################
@@ -223,10 +235,15 @@ class MuonAdamW(Optimizer):
                 m_hat = buf1 / bias_correction1
                 v_hat = buf2 / bias_correction2
 
-                g = m_hat / (v_hat.sqrt() + eps)
+                # v_hat <- v_hat.sqrt() + eps
+                v_hat.sqrt_().add_(eps)
+                # m_hat <- m_hat / (v_hat.sqrt() + eps)
+                m_hat.div_(v_hat)
 
-                p.data.mul_(1 - lr * weight_decay)
-                p.data.add_(g, alpha=-lr)
+                if weight_decay != 0:
+                    p.data.mul_(1 - lr * weight_decay)
+
+                p.data.add_(m_hat, alpha=-lr)
 
         return loss
 
@@ -252,8 +269,11 @@ class MuonSGD(Optimizer):
         momentum: The momentum used by the internal SGD. (0.95 is a good default)
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iterations to run. (6 is probably always enough)
-        sgd_params: The parameters to be optimized by SGD. Any parameters in `muon_params` which are
-        {0, 1}-D or are detected as being the embed or lm_head will be optimized by SGD as well.
+        sgd_params: The parameters to be optimized by SGD with weight decay. Any parameters in
+        `muon_params` which are {0, 1}-D or are detected as being the embed or lm_head will be
+        optimized by SGD as well.
+        sgd_nowd_params: The parameters to be optimized by SGD without weight decay (1d params
+        like norms/biases/LayerScale, and 0d params like logit_scale/logit_bias).
         sgd_momentum: The momentum for the internal SGD fallback.
         sgd_nesterov: Whether to use Nesterov-style momentum in the SGD fallback.
     """
@@ -266,6 +286,7 @@ class MuonSGD(Optimizer):
                  nesterov=True,
                  ns_steps=5,
                  sgd_params=None,
+                 sgd_nowd_params=None,
                  sgd_momentum=0.9,
                  sgd_nesterov=False):
         defaults = dict(lr=lr,
@@ -276,26 +297,35 @@ class MuonSGD(Optimizer):
                         sgd_momentum=sgd_momentum,
                         sgd_nesterov=sgd_nesterov)
 
-        params = list(muon_params)
+        muon_params = list(muon_params) if muon_params is not None else []
         sgd_params = list(sgd_params) if sgd_params is not None else []
-        params.extend(sgd_params)
-        super().__init__(params, defaults)
+        sgd_nowd_params = list(
+            sgd_nowd_params) if sgd_nowd_params is not None else []
 
-        # Sort parameters into those for which we will use Muon, and those for which we will not
+        param_groups = []
+        if len(muon_params) > 0 or len(sgd_params) > 0:
+            param_groups.append({
+                'params': muon_params + sgd_params,
+                'wd': wd,
+            })
+        if len(sgd_nowd_params) > 0:
+            param_groups.append({
+                'params': sgd_nowd_params,
+                'wd': 0.,
+            })
+        super().__init__(param_groups, defaults)
+
         for p in muon_params:
-            # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
             assert p.ndim >= 2, f"Muon requires parameters with ndim >= 2, got {p.ndim}"
             self.state[p]["use_muon"] = True
-        for p in sgd_params:
-            # Do not use Muon for parameters in sgd_params
+        for p in sgd_params + sgd_nowd_params:
             self.state[p]["use_muon"] = False
 
     def adjust_lr_for_muon(self, lr, param_shape):
         A, B = param_shape[:2]
-        # We adjust the learning rate and weight decay based on the size of the parameter matrix
-        # as described in the paper
         adjusted_ratio = 0.2 * math.sqrt(max(A, B))
         adjusted_lr = lr * adjusted_ratio
+
         return adjusted_lr
 
     def step(self, closure=None):
@@ -350,8 +380,8 @@ class MuonSGD(Optimizer):
                 # scale update
                 adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
 
-                # apply weight decay
-                p.data.mul_(1 - lr * wd)
+                if wd != 0:
+                    p.data.mul_(1 - lr * wd)
 
                 # apply update
                 p.data.add_(u.view(original_shape), alpha=-adjusted_lr)
@@ -372,7 +402,9 @@ class MuonSGD(Optimizer):
                 g = p.grad
                 if g is None:
                     continue
-                p.data.mul_(1 - lr * weight_decay)
+
+                if weight_decay != 0:
+                    p.data.mul_(1 - lr * weight_decay)
 
                 state = self.state[p]
                 if "momentum_buffer" not in state:

@@ -11,13 +11,14 @@ import functools
 import re
 import time
 
+from collections import OrderedDict
+
 import torch
 import deepspeed
 from torch.utils.data import DataLoader
 
 from tools.image_tokenizer_scripts import train_fsq_model_deepspeed
-from tools.utils import (get_logger, set_seed, worker_seed_init_fn, Scheduler,
-                         DeepSpeedEmaModel)
+from tools.utils import get_logger, set_seed, worker_seed_init_fn, Scheduler, DeepSpeedEmaModel
 
 
 def build_param_groups(config, model):
@@ -195,27 +196,11 @@ def build_deepspeed_config(config):
     # Mixed precision
     if config.use_amp:
         if config.amp_type == torch.float16:
-            ds_config["fp16"] = {
-                "enabled": True,
-                # 0代表启用dynamic loss scaling
-                "loss_scale": 0,
-                # dynamic loss scaling的初始值为65536,2的16次方
-                "initial_scale_power": 16,
-                # 连续1000个step没有出现overflow的情况下loss scale会翻倍(尝试更激进的缩放以获得更好的梯度精度),1000是DeepSpeed默认值
-                "loss_scale_window": 1000,
-                # 连续发生2次overflow之后才真正将loss scale减半
-                "hysteresis": 2,
-                # loss scale下限为1
-                "min_loss_scale": 1,
-            }
             ds_config["torch_autocast"] = {
                 "enabled": True,
                 "dtype": "float16",
             }
         elif config.amp_type == torch.bfloat16:
-            ds_config["bf16"] = {
-                "enabled": True,
-            }
             ds_config["torch_autocast"] = {
                 "enabled": True,
                 "dtype": "bfloat16",
@@ -266,6 +251,41 @@ def build_deepspeed_config(config):
     # ZeRO stage 0 does not use the ZeRO optimizer wrapper, so reduce_scatter is irrelevant.
     if optimizer_name == 'Muon' and config.deepspeed_zero_stage in [1, 2, 3]:
         ds_config["zero_optimization"]["reduce_scatter"] = False
+
+    # For deepspeed==0.19.3, ZeRO stage 0 does NOT implement Muon at all.
+    # Traced through the source:
+    #   1. engine._configure_basic_optimizer() (runtime/engine.py:2072) builds a
+    #      MuonWithAuxAdam with a use_muon=True group (ndim>=2, name free of
+    #      "embed"/"lm_head") and a use_muon=False group for the rest.
+    #   2. engine._do_optimizer_sanity_check() (runtime/engine.py:1857) sees
+    #      zero_optimization() == False for stage 0, so with
+    #      model_dtype == grad_accum_dtype == bf16 it returns DDP_BFLOAT16. The
+    #      engine then wraps the optimizer in FP16_UnfusedOptimizer
+    #      (runtime/engine.py:1941), NOT in a ZeRO optimizer.
+    #   3. MuonWithAuxAdam.step() (runtime/zero/muon/muon_optimizer.py:26-31)
+    #      performs only
+    #          p.mul_(1 - lr * weight_decay); p.add_(p.grad, alpha=-lr)
+    #      for the muon group. Its own comment states that the real update was
+    #      "moved to the deepspeed's optimizer" because the parameter it sees
+    #      there is a flattened view.
+    #   4. The real muon_update() -- momentum lerp, Newton-Schulz
+    #      orthogonalization and the sqrt(max(A, B)) spectral scaling -- is
+    #      reachable from exactly two places:
+    #          runtime/zero/stage_1_and_2.py:2080  (get_flat_partition)
+    #          runtime/zero/stage3.py:1609         (_apply_distributed_muon_update)
+    #      Both live inside the ZeRO optimizer, which stage 0 never builds.
+    #
+    # Net effect of stage 0 + Muon:
+    #   - muon group (ndim>=2)  -> plain SGD: no momentum, no Newton-Schulz, no
+    #                              spectral scaling; only decoupled weight decay.
+    #   - adamw group (ndim<2, embed, lm_head) -> genuine AdamW.
+    # Training would run to completion and the loss would fall, but the
+    # optimizer is mathematically not Muon and the run is not comparable to a
+    # stage 1/2/3 run. Fail loudly instead of silently training the wrong thing.
+    assert not (optimizer_name == 'Muon'
+                and config.deepspeed_zero_stage == 0), \
+        'Muon is not implemented for ZeRO stage 0 in deepspeed 0.19.3 (see comment above). ' \
+        'Use deepspeed_zero_stage in [1, 2, 3], or switch to the pytorch launcher with MuonAdamW.'
 
     if optimizer_name == 'SGD':
         ds_config["optimizer"] = {
@@ -331,26 +351,88 @@ def get_model_state_dict(model_engine, config):
     """Get full model state dict for saving.
     For ZeRO-3, all ranks must call (GatheredParameters is collective),
     but only rank 0 returns a non-None dict.
+
+    ZeRO-3 note: parameters are gathered ONE MODULE AT A TIME instead of all
+    at once. deepspeed.zero.GatheredParameters.__enter__ calls all_gather
+    unconditionally (partition_parameters.py: `self.params[0].all_gather(...)`),
+    so gathering list(module.parameters()) in a single context materialises a
+    full extra copy of the model on EVERY rank -- not just rank 0 -- on top of
+    the 1/N shard each rank already holds. Worse, with the default
+    modifier_rank=None that memory is NOT released on context exit; the
+    GatheredParameters docstring explicitly says a non-None modifier_rank is
+    required for the gathered memory to be freed.
+
+    Walking module by module with recurse=False caps the extra GPU memory at
+    the largest single module's own parameters and modifier_rank=0 releases it
+    after each module. The total volume of communication is unchanged: every
+    parameter is still all_gathered exactly once.
+
+    This mirrors DeepSpeedEngine._zero3_consolidated_16bit_state_dict(), but
+    keeps the module root under our control so the produced key namespace is
+    byte-for-byte the one module.state_dict() yields on the non-ZeRO-3 path,
+    including when torch.compile is enabled (which would otherwise prefix
+    every key with '_orig_mod.').
     """
     if config.use_compile:
         module = model_engine.module._orig_mod
     else:
         module = model_engine.module
 
-    if config.deepspeed_zero_stage == 3:
-        # Batch gather all parameters at once to reduce communication rounds
-        all_params = list(module.parameters())
-        with deepspeed.zero.GatheredParameters(all_params):
-            if config.total_rank == 0 and config.local_rank == 0:
-                state_dict = {
-                    k: v.cpu().clone()
-                    for k, v in module.state_dict().items()
-                }
-            else:
-                state_dict = None
-        return state_dict
-    else:
+    if config.deepspeed_zero_stage != 3:
         return module.state_dict()
+
+    is_master = (config.total_rank == 0 and config.local_rank == 0)
+    state_dict = OrderedDict() if is_master else None
+    # Maps a parameter's unique id to the first state_dict key holding it, so
+    # that tied weights stay a single shared tensor instead of being
+    # duplicated into two independent copies.
+    shared_params = {}
+
+    def get_layer_state_dict(per_module, prefix=''):
+        # Gather only this module's OWN parameters; children are handled by
+        # the recursive calls below. modifier_rank=0 frees the gathered GPU
+        # memory when the context exits.
+        with deepspeed.zero.GatheredParameters(list(
+                per_module.parameters(recurse=False)),
+                                               modifier_rank=0):
+            if is_master:
+                for name, param in per_module.named_parameters(recurse=False):
+                    if param is None:
+                        continue
+                    key = prefix + name
+                    # param.data_ptr() is unusable as a key here because the
+                    # gather buffer is reused across modules; ds_id is stable
+                    # and identical for tied parameters.
+                    param_key = getattr(param, 'ds_id', None)
+                    if param_key is None:
+                        param_key = id(param)
+                    if param_key in shared_params:
+                        state_dict[key] = state_dict[shared_params[param_key]]
+                    else:
+                        state_dict[key] = param.detach().cpu()
+                        shared_params[param_key] = key
+
+                # Buffers are replicated (never partitioned) under ZeRO-3, so
+                # they can be read directly. Non-persistent buffers are
+                # skipped, exactly as nn.Module.state_dict() does.
+                for name, buffer in per_module.named_buffers(recurse=False):
+                    if buffer is not None and name not in per_module._non_persistent_buffers_set:
+                        state_dict[prefix + name] = buffer.detach().cpu()
+
+        for name, child in per_module.named_children():
+            if child is not None:
+                get_layer_state_dict(child, prefix + name + '.')
+
+    # Make sure every parameter is partitioned before gathering starts.
+    if model_engine._optimizer_has_ckpt_event_prologue():
+        model_engine.optimizer.checkpoint_event_prologue()
+
+    get_layer_state_dict(module, prefix='')
+
+    if model_engine._optimizer_has_ckpt_event_epilogue():
+        model_engine.optimizer.checkpoint_event_epilogue()
+
+    return state_dict
 
 
 def parse_args():
@@ -410,7 +492,7 @@ def main():
 
     init_fn = functools.partial(worker_seed_init_fn,
                                 num_workers=num_workers,
-                                local_rank=local_rank,
+                                global_rank=total_rank,
                                 seed=config.seed)
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         config.train_dataset, shuffle=True)
@@ -639,7 +721,9 @@ def main():
             'lr': scheduler.current_lr,
             'scheduler_state_dict': scheduler.state_dict(),
         }
-        # Include EMA state in client_state for resume
+        # Include EMA state in client_state for resume. The EMA object keeps a
+        # complete copy of its own state, so it needs no reference to the
+        # engine here.
         if config.use_ema_model:
             client_state['ema_model_state'] = config.ema_model.state_dict()
 

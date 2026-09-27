@@ -6,6 +6,8 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(BASE_DIR)
 warnings.filterwarnings('ignore')
 
+from collections import OrderedDict
+
 import numpy as np
 from tqdm import tqdm
 
@@ -33,6 +35,100 @@ def all_reduce_operation_in_group_for_variables(variables,
         variables[i] = variables[i].item()
 
     return variables
+
+
+def get_model_state_dict(model_engine, config, zero_stage):
+    """Get full model state dict for saving.
+    For ZeRO-3, all ranks must call (GatheredParameters is collective),
+    but only rank 0 returns a non-None dict.
+
+    ZeRO-3 note: parameters are gathered ONE MODULE AT A TIME instead of all
+    at once. deepspeed.zero.GatheredParameters.__enter__ calls all_gather
+    unconditionally (partition_parameters.py: `self.params[0].all_gather(...)`),
+    so gathering list(module.parameters()) in a single context materialises a
+    full extra copy of the model on EVERY rank -- not just rank 0 -- on top of
+    the 1/N shard each rank already holds. Worse, with the default
+    modifier_rank=None that memory is NOT released on context exit; the
+    GatheredParameters docstring explicitly says a non-None modifier_rank is
+    required for the gathered memory to be freed.
+
+    Walking module by module with recurse=False caps the extra GPU memory at
+    the largest single module's own parameters and modifier_rank=0 releases it
+    after each module. The total volume of communication is unchanged: every
+    parameter is still all_gathered exactly once.
+
+    This mirrors DeepSpeedEngine._zero3_consolidated_16bit_state_dict(), but
+    keeps the module root under our control so the produced key namespace is
+    byte-for-byte the one module.state_dict() yields on the non-ZeRO-3 path,
+    including when torch.compile is enabled (which would otherwise prefix
+    every key with '_orig_mod.').
+    """
+    if config.use_compile:
+        module = model_engine.module._orig_mod
+    else:
+        module = model_engine.module
+
+    if zero_stage != 3:
+        return module.state_dict()
+
+    local_rank = config.local_rank
+    if hasattr(config, 'total_rank'):
+        total_rank = config.total_rank
+    else:
+        total_rank = 0
+
+    is_master = (total_rank == 0 and local_rank == 0)
+    state_dict = OrderedDict() if is_master else None
+    # Maps a parameter's unique id to the first state_dict key holding it, so
+    # that tied weights stay a single shared tensor instead of being
+    # duplicated into two independent copies.
+    shared_params = {}
+
+    def get_layer_state_dict(per_module, prefix=''):
+        # Gather only this module's OWN parameters; children are handled by
+        # the recursive calls below. modifier_rank=0 frees the gathered GPU
+        # memory when the context exits.
+        with deepspeed.zero.GatheredParameters(list(
+                per_module.parameters(recurse=False)),
+                                               modifier_rank=0):
+            if is_master:
+                for name, param in per_module.named_parameters(recurse=False):
+                    if param is None:
+                        continue
+                    key = prefix + name
+                    # param.data_ptr() is unusable as a key here because the
+                    # gather buffer is reused across modules; ds_id is stable
+                    # and identical for tied parameters.
+                    param_key = getattr(param, 'ds_id', None)
+                    if param_key is None:
+                        param_key = id(param)
+                    if param_key in shared_params:
+                        state_dict[key] = state_dict[shared_params[param_key]]
+                    else:
+                        state_dict[key] = param.detach().cpu()
+                        shared_params[param_key] = key
+
+                # Buffers are replicated (never partitioned) under ZeRO-3, so
+                # they can be read directly. Non-persistent buffers are
+                # skipped, exactly as nn.Module.state_dict() does.
+                for name, buffer in per_module.named_buffers(recurse=False):
+                    if buffer is not None and name not in per_module._non_persistent_buffers_set:
+                        state_dict[prefix + name] = buffer.detach().cpu()
+
+        for name, child in per_module.named_children():
+            if child is not None:
+                get_layer_state_dict(child, prefix + name + '.')
+
+    # Make sure every parameter is partitioned before gathering starts.
+    if model_engine._optimizer_has_ckpt_event_prologue():
+        model_engine.optimizer.checkpoint_event_prologue()
+
+    get_layer_state_dict(module, prefix='')
+
+    if model_engine._optimizer_has_ckpt_event_epilogue():
+        model_engine.optimizer.checkpoint_event_epilogue()
+
+    return state_dict
 
 
 def train_vqgan_model(train_loader, generator_model, discriminator_model,
@@ -443,7 +539,8 @@ def train_vqgan_model(train_loader, generator_model, discriminator_model,
             epoch - 1) + accumulation_iter_index
         if hasattr(config,
                    'use_step_save_interval') and config.use_step_save_interval:
-            if total_accumulation_iters % config.step_save_interval == 0:
+            if (iter_index % config.accumulation_steps == 0 and
+                    total_accumulation_iters % config.step_save_interval == 0):
                 if local_rank == 0 and total_rank == 0:
                     if config.use_ema_model:
                         save_generator_model = config.generator_ema_model.ema_model.module.state_dict(
@@ -706,7 +803,8 @@ def train_vqgan_model_deepspeed(train_loader, generator_model,
             epoch - 1) + accumulation_iter_index
         if hasattr(config,
                    'use_step_save_interval') and config.use_step_save_interval:
-            if total_accumulation_iters % config.step_save_interval == 0:
+            if (iter_index % config.accumulation_steps == 0 and
+                    total_accumulation_iters % config.step_save_interval == 0):
                 generator_save_path = os.path.join(
                     config.checkpoint_dir,
                     f'step_{total_accumulation_iters}_generator_model.pth')
@@ -731,36 +829,29 @@ def train_vqgan_model_deepspeed(train_loader, generator_model,
                                    discriminator_save_path)
                 else:
                     # EMA disabled: save training model
-                    if config.use_compile:
-                        generator_module = generator_model.module._orig_mod
-                        discriminator_module = discriminator_model.module._orig_mod
-                    else:
-                        generator_module = generator_model.module
-                        discriminator_module = discriminator_model.module
-
-                    # Generator: respect ZeRO stage for parameter gathering
+                    # Generator: save depends on config.deepspeed_zero_stage
                     if config.deepspeed_zero_stage == 3:
-                        # Batch gather all parameters at once to reduce
-                        # communication rounds under ZeRO-3
-                        all_params = list(generator_module.parameters())
-                        with deepspeed.zero.GatheredParameters(all_params):
-                            if local_rank == 0 and total_rank == 0:
-                                generator_state_dict = {
-                                    k: v.cpu().clone()
-                                    for k, v in
-                                    generator_module.state_dict().items()
-                                }
-                        if local_rank == 0 and total_rank == 0:
-                            torch.save(generator_state_dict,
+                        # ZeRO-3: all ranks must participate in GatheredParameters
+                        save_generator_model = get_model_state_dict(
+                            generator_model, config,
+                            config.deepspeed_zero_stage)
+                        if local_rank == 0 and total_rank == 0 and save_generator_model is not None:
+                            torch.save(save_generator_model,
                                        generator_save_path)
                     else:
+                        # ZeRO-0/1/2: only global rank 0 needs to call state_dict
                         if local_rank == 0 and total_rank == 0:
-                            torch.save(generator_module.state_dict(),
+                            save_generator_model = get_model_state_dict(
+                                generator_model, config,
+                                config.deepspeed_zero_stage)
+                            torch.save(save_generator_model,
                                        generator_save_path)
 
-                    # Discriminator: always ZeRO Stage 0, no parameter partitioning
+                    # Discriminator: always ZeRO Stage 0, only rank 0 saves
                     if local_rank == 0 and total_rank == 0:
-                        torch.save(discriminator_module.state_dict(),
+                        save_discriminator_model = get_model_state_dict(
+                            discriminator_model, config, 0)
+                        torch.save(save_discriminator_model,
                                    discriminator_save_path)
 
         iter_index += 1
@@ -1048,7 +1139,8 @@ def train_fsq_model(train_loader, model, criterion, optimizer, scheduler,
             epoch - 1) + accumulation_iter_index
         if hasattr(config,
                    'use_step_save_interval') and config.use_step_save_interval:
-            if total_accumulation_iters % config.step_save_interval == 0:
+            if (iter_index % config.accumulation_steps == 0 and
+                    total_accumulation_iters % config.step_save_interval == 0):
                 if local_rank == 0 and total_rank == 0:
                     if config.use_ema_model:
                         save_model = config.ema_model.ema_model.module.state_dict(
@@ -1167,7 +1259,8 @@ def train_fsq_model_deepspeed(train_loader, model, criterion, optimizer,
             epoch - 1) + accumulation_iter_index
         if hasattr(config,
                    'use_step_save_interval') and config.use_step_save_interval:
-            if total_accumulation_iters % config.step_save_interval == 0:
+            if (iter_index % config.accumulation_steps == 0 and
+                    total_accumulation_iters % config.step_save_interval == 0):
                 save_path = os.path.join(
                     config.checkpoint_dir,
                     f'step_{total_accumulation_iters}.pth')

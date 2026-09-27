@@ -15,8 +15,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from tools.image_tokenizer_scripts import train_fsq_model
-from tools.utils import (get_logger, set_seed, worker_seed_init_fn,
-                         build_optimizer, Scheduler, build_training_mode)
+from tools.utils import get_logger, set_seed, worker_seed_init_fn, build_optimizer, Scheduler, build_training_mode
 
 
 def parse_args():
@@ -83,7 +82,7 @@ def main():
 
     init_fn = functools.partial(worker_seed_init_fn,
                                 num_workers=num_workers,
-                                local_rank=local_rank,
+                                global_rank=total_rank,
                                 seed=config.seed)
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         config.train_dataset, shuffle=True)

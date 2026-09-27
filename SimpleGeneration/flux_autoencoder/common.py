@@ -46,6 +46,7 @@ class PIL2Opencv:
 class FLUXResize:
 
     def __init__(self, resize=1024):
+        assert resize % 16 == 0, f'resize must be a multiple of 16, got {resize}'
         self.resize = resize
 
     def __call__(self, sample):
@@ -59,8 +60,8 @@ class FLUXResize:
         max_side = max(width, height)
         scale = self.resize / max_side
 
-        new_width = int(32 * round(width * scale / 32))
-        new_height = int(32 * round(height * scale / 32))
+        new_width = int(16 * round(width * scale / 16))
+        new_height = int(16 * round(height * scale / 16))
 
         image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
@@ -217,16 +218,11 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 
-def load_state_dict(saved_model_path,
-                    model,
-                    excluded_layer_name=(),
-                    loading_new_input_size_position_encoding_weight=False):
+def load_state_dict(saved_model_path, model, excluded_layer_name=()):
     '''
     saved_model_path: a saved model.state_dict() .pth file path
     model: a new defined model
     excluded_layer_name: layer names that doesn't want to load parameters
-    loading_new_input_size_position_encoding_weight: default False, for vit net, loading a position encoding layer with new input size, set True
-    only load layer parameters which has same layer name and same layer weight shape
     '''
     if not saved_model_path:
         print('No pretrained model file!')
@@ -245,50 +241,6 @@ def load_state_dict(saved_model_path,
             filtered_state_dict[name] = weight
         else:
             not_loaded_save_state_dict.append(name)
-
-    position_encoding_already_loaded = False
-    if 'pos_embed' in filtered_state_dict.keys():
-        position_encoding_already_loaded = True
-
-    # for vit net, loading a position encoding layer with new input size
-    if loading_new_input_size_position_encoding_weight and not position_encoding_already_loaded:
-        # assert position_encoding_layer name are unchanged for model and saved_model
-        # assert class_token num are unchanged for model and saved_model
-        # assert embedding_planes are unchanged for model and saved_model
-        if hasattr(model, 'cls_token') and hasattr(model, 'pos_embed'):
-            model_num_cls_token = model.cls_token.shape[1]
-            model_embedding_planes = model.pos_embed.shape[2]
-            model_encoding_shape = int(
-                (model.pos_embed.shape[1] - model_num_cls_token)**0.5)
-            encoding_layer_name, encoding_layer_weight = None, None
-            for name, weight in saved_state_dict.items():
-                if 'pos_embed' in name:
-                    encoding_layer_name = name
-                    encoding_layer_weight = weight
-                    break
-            save_model_encoding_shape = int(
-                (encoding_layer_weight.shape[1] - model_num_cls_token)**0.5)
-
-            save_model_cls_token_weight = encoding_layer_weight[:, 0:
-                                                                model_num_cls_token, :]
-            save_model_position_weight = encoding_layer_weight[:,
-                                                               model_num_cls_token:, :]
-            save_model_position_weight = save_model_position_weight.reshape(
-                -1, save_model_encoding_shape, save_model_encoding_shape,
-                model_embedding_planes).permute(0, 3, 1, 2)
-            save_model_position_weight = F.interpolate(
-                save_model_position_weight,
-                size=(model_encoding_shape, model_encoding_shape),
-                mode='bicubic')
-            save_model_position_weight = save_model_position_weight.permute(
-                0, 2, 3, 1).flatten(1, 2)
-            model_encoding_layer_weight = torch.cat(
-                (save_model_cls_token_weight, save_model_position_weight),
-                dim=1)
-
-            filtered_state_dict[
-                encoding_layer_name] = model_encoding_layer_weight
-            not_loaded_save_state_dict.remove('pos_embed')
 
     if len(filtered_state_dict) == 0:
         print('No pretrained parameters to load!')

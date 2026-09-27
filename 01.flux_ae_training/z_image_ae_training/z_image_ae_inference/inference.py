@@ -9,6 +9,7 @@ sys.path.append(BASE_DIR)
 warnings.filterwarnings('ignore')
 
 import argparse
+import math
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
@@ -22,7 +23,7 @@ from tools.utils import set_seed
 
 def resize_image(image, min_mp=0.5, max_mp=2.0):
     """
-    调整图像大小，使其百万像素数在指定范围内，且尺寸为32的倍数
+    调整图像大小，使其百万像素数在指定范围内，且尺寸为16的倍数
     
     参数:
         image: PIL图像对象
@@ -32,16 +33,17 @@ def resize_image(image, min_mp=0.5, max_mp=2.0):
     # 获取图像的宽度和高度（单位：像素）
     width, height = image.size
 
-    # 计算当前图像的百万像素数（总像素数除以100万）
+    # 计算当前图像的百万像素数（总像素数除以400万）
     mp = (width * height) / 4000000
 
     # 检查当前百万像素数是否在指定的范围内
     if min_mp <= mp <= max_mp:
-        # 即使MP在范围内，也需要确保宽高都是32的倍数
-        # 将宽度调整为最接近的32的倍数（先除以32，四舍五入，再乘以32）
-        new_width = int(32 * round(width / 32))
-        # 将高度调整为最接近的32的倍数
-        new_height = int(32 * round(height / 32))
+        # 即使MP在范围内，也需要确保宽高都是16的倍数
+        # 该分支没有缩放意图，只做对齐，因此用四舍五入取最接近的16的倍数
+        # 将宽度调整为最接近的16的倍数（先除以16，四舍五入，再乘以16）
+        new_width = int(16 * round(width / 16))
+        # 将高度调整为最接近的16的倍数
+        new_height = int(16 * round(height / 16))
 
         # 如果调整后的尺寸与原尺寸不同，需要重新缩放图像
         if new_width != width or new_height != height:
@@ -51,7 +53,7 @@ def resize_image(image, min_mp=0.5, max_mp=2.0):
             # 返回调整后的图像
             return image
 
-        # 如果尺寸已经是32的倍数，直接返回原图像
+        # 如果尺寸已经是16的倍数，直接返回原图像
         return image
 
     # 如果MP不在范围内，需要计算缩放因子
@@ -59,14 +61,15 @@ def resize_image(image, min_mp=0.5, max_mp=2.0):
     if mp < min_mp:
         # 缩放因子 = sqrt(目标MP / 当前MP)，开平方是因为宽高都要缩放
         scale = (min_mp / mp)**0.5
+        # 放大意图：向上取整到16的倍数，保证对齐后MP不会反向小于min_mp
+        new_width = int(16 * math.ceil(width * scale / 16))
+        new_height = int(16 * math.ceil(height * scale / 16))
     else:
         # 当前MP大于最大值时，需要缩小图像
         scale = (max_mp / mp)**0.5
-
-    # 根据缩放因子计算新宽度，并确保是32的倍数
-    new_width = int(32 * round(width * scale / 32))
-    # 根据缩放因子计算新高度，并确保是32的倍数
-    new_height = int(32 * round(height * scale / 32))
+        # 缩小意图：向下取整到16的倍数，保证对齐后MP不会反向大于max_mp
+        new_width = int(16 * math.floor(width * scale / 16))
+        new_height = int(16 * math.floor(height * scale / 16))
 
     # 使用LANCZOS重采样算法调整图像到新尺寸
     image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
@@ -112,6 +115,9 @@ def main():
         per_image = Image.open(per_image_path).convert('RGB')
         per_image_origin_width, per_image_origin_height = per_image.size
 
+        assert per_image_origin_height >= 64 and per_image_origin_width >= 64
+        assert per_image_origin_height / per_image_origin_width <= 8 and per_image_origin_width / per_image_origin_height <= 8
+
         print('1212', per_image_origin_width, per_image_origin_height)
 
         per_image = resize_image(per_image)
@@ -137,6 +143,7 @@ def main():
         print('1414', per_output.shape, torch.max(per_output),
               torch.min(per_output))
 
+        per_output = per_output.float()
         per_output = (per_output * 0.5 + 0.5) * 255.
         per_output = torch.clamp(per_output, min=0, max=255)
         per_output = per_output.cpu().numpy().astype(np.uint8)

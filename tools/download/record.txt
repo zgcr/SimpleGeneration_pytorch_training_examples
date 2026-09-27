@@ -1,0 +1,27 @@
+pip install -U huggingface_hub
+pip install hf_transfer
+hf auth login
+
+set HF_HUB_DOWNLOAD_TIMEOUT=120
+set HF_HUB_ENABLE_HF_TRANSFER=1
+set HF_XET_HIGH_PERFORMANCE=1
+set HF_XET_NUM_CONCURRENT_RANGE_GETS=64
+set HF_ENDPOINT=https://hf-mirror.com
+
+hf download --repo-type dataset stanford-vision-lab/gpic --local-dir /root/autodl-tmp/huggingface_datasets/gpic --max-workers 32
+modelscope download --dataset AI-ModelScope/ImgEdit --local_dir /root/autodl-tmp/huggingface_datasets/ImgEdit --max-workers 32
+hf download --repo-type dataset OPPOer/X2Edit-Dataset --local-dir /root/autodl-tmp/huggingface_datasets/X2Edit-Dataset --max-workers 32
+hf download --repo-type dataset openvivo/VINS-120K --local-dir /root/autodl-tmp/huggingface_datasets/VINS-120K --max-workers 32
+hf download --repo-type dataset LucasFang/FLUX-Reason-6M --local-dir /root/autodl-tmp/huggingface_datasets/FLUX-Reason-6M --max-workers 32
+hf download --repo-type dataset Super-shuhe/FaceID-6M --local-dir /root/autodl-tmp/huggingface_datasets/FaceID-6M --max-workers 32
+hf download --repo-type dataset 0xLDF/SACap-1M --local-dir /root/autodl-tmp/huggingface_datasets/SACap-1M --max-workers 32
+hf download --repo-type dataset bytedance-research/UNO-1M --local-dir /root/autodl-tmp/huggingface_datasets/UNO-1M --max-workers 32
+hf download --repo-type dataset ma-xu/fine-t2i --local-dir /root/autodl-tmp/huggingface_datasets/fine-t2i --max-workers 32
+hf download --repo-type dataset tencent/MegaStyle-1.4M --local-dir /root/autodl-tmp/huggingface_datasets/MegaStyle-1.4M --max-workers 32
+hf download --repo-type dataset ByteMorph/BM-6M --local-dir /root/autodl-tmp/huggingface_datasets/BM-6M --max-workers 32
+hf download --repo-type dataset InternVL-U/ScaleEdit-12M --local-dir /root/autodl-tmp/huggingface_datasets/ScaleEdit-12M --max-workers 32
+hf download --repo-type dataset a1557811266/Inter-Edit-Train --local-dir /root/autodl-tmp/huggingface_datasets/Inter-Edit-Train --max-workers 32
+hf download --repo-type dataset WeiChow/CrispEdit-2M --local-dir /root/autodl-tmp/huggingface_datasets/CrispEdit-2M --max-workers 32
+hf download --repo-type dataset xiaotanhua/UnicEdit-10M --local-dir /root/autodl-tmp/huggingface_datasets/UnicEdit-10M --max-workers 32
+hf download --repo-type dataset inclusionAI/ConceptEdit-12M --local-dir /root/autodl-tmp/huggingface_datasets/ConceptEdit-12M --max-workers 32
+hf download --repo-type dataset jasperai/monet --local-dir /root/autodl-tmp/huggingface_datasets/monet --max-workers 32

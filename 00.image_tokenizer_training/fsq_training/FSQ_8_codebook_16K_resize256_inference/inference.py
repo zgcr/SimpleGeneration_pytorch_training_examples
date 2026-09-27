@@ -103,6 +103,7 @@ def main():
         print('2222', per_output.shape, torch.max(per_output),
               torch.min(per_output))
 
+        per_output = per_output.float()
         per_output = (per_output * 0.5 + 0.5) * 255.
         per_output = torch.clamp(per_output, min=0, max=255)
         per_output = per_output.cpu().numpy().astype(np.uint8)

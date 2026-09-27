@@ -90,12 +90,14 @@ class config:
         },
     )
 
+    # The discriminator model is always fixed at ZeRO stage 0
+    # (DISCRIMINATOR_ZERO_STAGE), and deepspeed==0.19.3 does not implement Muon
+    # for ZeRO stage 0, so the discriminator model can't use Muon optimizer.
     discriminator_optimizer = (
-        'Muon',
+        'AdamW',
         {
             'lr': 1e-4,
             'weight_decay': 0,
-            'exclude_muon_layer_name_list': [],
         },
     )
 

@@ -99,10 +99,8 @@ def set_seed(seed):
     cudnn.deterministic = True
 
 
-def worker_seed_init_fn(worker_id, num_workers, local_rank, seed):
-    # worker_seed_init_fn function will be called at the beginning of each epoch
-    # for each epoch the same worker has same seed value,so we add the current time to the seed
-    worker_seed = num_workers * local_rank + worker_id + seed + int(
+def worker_seed_init_fn(worker_id, num_workers, global_rank, seed):
+    worker_seed = num_workers * global_rank + worker_id + seed + int(
         time.time())
     np.random.seed(worker_seed)
     random.seed(worker_seed)
@@ -138,7 +136,6 @@ class EmaModel(nn.Module):
 
     def __init__(self, model, decay=0.9999, tau=2000, updates=0):
         super(EmaModel, self).__init__()
-        # make a copy of the model for accumulating moving average of weights
         self.ema_model = copy.deepcopy(model)
         self.ema_model.eval()
         self.updates = updates
@@ -148,6 +145,9 @@ class EmaModel(nn.Module):
         with torch.no_grad():
             self.updates += 1
             d = self.decay(self.updates)
+
+            if hasattr(model, '_orig_mod'):
+                model = model._orig_mod
 
             model_requires_grad = {}
             for name, param in model.named_parameters():
@@ -251,7 +251,31 @@ class DeepSpeedEmaModel:
             ema_full_state_dict = {}
             world_size = torch.distributed.get_world_size()
 
-            for name, param in module.named_parameters():
+            # Maps a parameter's unique id to the first key that holds its
+            # gathered EMA tensor. Tied weights (e.g. a VLM's lm_head.weight
+            # and embed_tokens.weight) share one nn.Parameter, so without
+            # this they would be all_gathered twice and stored as two
+            # independent tensors, silently doubling both the communication
+            # and the host memory for the largest weight in the model.
+            #
+            # Note that named_parameters() itself de-duplicates by default
+            # (remove_duplicate=True) and would therefore only yield the
+            # FIRST name of a tied group, leaving the other key missing from
+            # the saved state_dict entirely. remove_duplicate=False restores
+            # every key, and the map below keeps them sharing one tensor --
+            # exactly what nn.Module.state_dict() produces.
+            shared_params = {}
+
+            for name, param in module.named_parameters(remove_duplicate=False):
+                param_key = getattr(param, 'ds_id', None)
+                if param_key is None:
+                    param_key = id(param)
+
+                if param_key in shared_params:
+                    ema_full_state_dict[name] = ema_full_state_dict[
+                        shared_params[param_key]]
+                    continue
+
                 ema_local = self.ema_params[name]
                 # all_gather local EMA shards from all ranks
                 gathered = [
@@ -263,11 +287,23 @@ class DeepSpeedEmaModel:
                 ema_full_state_dict[
                     name] = full_param[:param.ds_numel].reshape(
                         param.ds_shape).cpu().clone()
+                shared_params[param_key] = name
 
-            # Also include non-parameter buffers from the model
-            # Buffers are replicated across ranks in ZeRO-3, just copy directly
-            for k, v in module.named_buffers():
-                ema_full_state_dict[k] = v.detach().cpu().clone()
+            # Also include non-parameter buffers from the model.
+            # Buffers are replicated (never partitioned) under ZeRO-3, so they
+            # can be read directly. Non-persistent buffers are skipped, exactly
+            # as nn.Module.state_dict() does, so that the produced key
+            # namespace stays byte-for-byte the one module.state_dict()
+            # yields. A plain named_buffers() call cannot do this: it returns
+            # dotted names, while _non_persistent_buffers_set holds the bare
+            # name on each owning submodule. Walking the modules one by one
+            # keeps both sides in the same namespace.
+            for per_module_name, per_module in module.named_modules():
+                per_module_prefix = f'{per_module_name}.' if per_module_name else ''
+                for k, v in per_module.named_buffers(recurse=False):
+                    if v is not None and k not in per_module._non_persistent_buffers_set:
+                        ema_full_state_dict[per_module_prefix +
+                                            k] = v.detach().cpu().clone()
 
             return ema_full_state_dict
         else:
@@ -419,7 +455,14 @@ class Scheduler:
                                    power) * (self.lr - min_lr) + min_lr
 
     def state_dict(self):
-        return {key: value for key, value in self.__dict__.items()}
+        return {
+            'scheduler_name': self.scheduler_name,
+            'warm_up_epochs': self.warm_up_epochs,
+            'epochs': self.epochs,
+            'lr': self.lr,
+            'current_lr': self.current_lr,
+            'init_param_groups_lr': self.init_param_groups_lr,
+        }
 
     def load_state_dict(self, state_dict):
         self.__dict__.update(state_dict)
@@ -457,7 +500,7 @@ def build_optimizer(config, model):
         param_layer_weight_dict[name] = param
 
         if global_weight_decay is False:
-            if param.ndim == 1 or any(no_weight_decay_layer_name in name
+            if param.ndim <= 1 or any(no_weight_decay_layer_name in name
                                       for no_weight_decay_layer_name in
                                       no_weight_decay_layer_name_list):
                 param_layer_decay_dict[name] = 0.
@@ -538,16 +581,17 @@ def build_optimizer(config, model):
             nesterov=nesterov), model_layer_weight_decay_list
 
     elif optimizer_name == 'MuonSGD':
-        # Note: MuonSGD uses unified lr and wd for all parameters.
-        # Per-layer lr/wd settings from optimizer_parameters are not applied.
-        # MuonSGD optimizer don't support global_weight_decay
-        # MuonSGD optimizer don't support no_weight_decay_layer_name_list
+        # Note: MuonSGD uses unified lr for all parameters.
+        # Per-layer lr settings from optimizer_parameters are not applied.
         # MuonSGD optimizer don't support sub_layer_lr/sub_layer_weight_decay
 
         exclude_muon_layer_name_list = [
             'position_encoding',
             'cls_token',
             'patch_embedding',
+            'embed',
+            'lm_head',
+            'merger',
         ]
         if 'exclude_muon_layer_name_list' in optimizer_parameters.keys(
         ) and isinstance(optimizer_parameters['exclude_muon_layer_name_list'],
@@ -555,22 +599,31 @@ def build_optimizer(config, model):
             exclude_muon_layer_name_list = exclude_muon_layer_name_list + optimizer_parameters[
                 'exclude_muon_layer_name_list']
 
-        # Separate parameters into muon_params and sgd_params
+        # Separate parameters into muon_params, sgd_params and sgd_nowd_params
         muon_param_list, muon_param_names = [], []
         sgd_param_list, sgd_param_names = [], []
+        sgd_nowd_param_list, sgd_nowd_param_names = [], []
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
 
-            # Muon is used for 2D parameters that are not in exclude list
+            # Muon is used for 2D parameters that are not in exclude list.
+            # The name is lowercased before matching, exactly like
+            # deepspeed.set_optimizer_flags does.
             use_muon = (
                 param.ndim >= 2
-                and not any(exclude_name in name
+                and not any(exclude_name in name.lower()
                             for exclude_name in exclude_muon_layer_name_list))
 
             if use_muon:
                 muon_param_list.append(param)
                 muon_param_names.append(name)
+            elif global_weight_decay is False and (param.ndim <= 1 or any(
+                    no_weight_decay_layer_name in name
+                    for no_weight_decay_layer_name in
+                    no_weight_decay_layer_name_list)):
+                sgd_nowd_param_list.append(param)
+                sgd_nowd_param_names.append(name)
             else:
                 sgd_param_list.append(param)
                 sgd_param_names.append(name)
@@ -591,6 +644,13 @@ def build_optimizer(config, model):
                 'lr': lr,
                 'weight_decay': weight_decay,
             })
+        if len(sgd_nowd_param_names) > 0:
+            model_layer_weight_decay_list.append({
+                'name': sgd_nowd_param_names,
+                'optimizer': 'MuonSGD(SGD)',
+                'lr': lr,
+                'weight_decay': 0.,
+            })
 
         momentum = 0.95 if 'momentum' not in optimizer_parameters.keys(
         ) else optimizer_parameters['momentum']
@@ -609,6 +669,7 @@ def build_optimizer(config, model):
             wd=weight_decay,
             muon_params=muon_param_list,
             sgd_params=sgd_param_list,
+            sgd_nowd_params=sgd_nowd_param_list,
             momentum=momentum,
             nesterov=nesterov,
             ns_steps=ns_steps,
@@ -628,16 +689,17 @@ def build_optimizer(config, model):
                                  eps=eps), model_layer_weight_decay_list
 
     elif optimizer_name == 'MuonAdamW':
-        # Note: MuonAdamW uses unified lr and wd for all parameters.
-        # Per-layer lr/wd settings from optimizer_parameters are not applied.
-        # MuonAdamW optimizer don't support global_weight_decay
-        # MuonAdamW optimizer don't support no_weight_decay_layer_name_list
+        # Note: MuonAdamW uses unified lr for all parameters.
+        # Per-layer lr settings from optimizer_parameters are not applied.
         # MuonAdamW optimizer don't support sub_layer_lr/sub_layer_weight_decay
 
         exclude_muon_layer_name_list = [
             'position_encoding',
             'cls_token',
             'patch_embedding',
+            'embed',
+            'lm_head',
+            'merger',
         ]
         if 'exclude_muon_layer_name_list' in optimizer_parameters.keys(
         ) and isinstance(optimizer_parameters['exclude_muon_layer_name_list'],
@@ -645,22 +707,31 @@ def build_optimizer(config, model):
             exclude_muon_layer_name_list = exclude_muon_layer_name_list + optimizer_parameters[
                 'exclude_muon_layer_name_list']
 
-        # Separate parameters into muon_params and adamw_params
+        # Separate parameters into muon_params, adamw_params and adamw_nowd_params
         muon_param_list, muon_param_names = [], []
         adamw_param_list, adamw_param_names = [], []
+        adamw_nowd_param_list, adamw_nowd_param_names = [], []
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
 
-            # Muon is used for 2D parameters that are not in exclude list
+            # Muon is used for 2D parameters that are not in exclude list.
+            # The name is lowercased before matching, exactly like
+            # deepspeed.set_optimizer_flags does.
             use_muon = (
                 param.ndim >= 2
-                and not any(exclude_name in name
+                and not any(exclude_name in name.lower()
                             for exclude_name in exclude_muon_layer_name_list))
 
             if use_muon:
                 muon_param_list.append(param)
                 muon_param_names.append(name)
+            elif global_weight_decay is False and (param.ndim <= 1 or any(
+                    no_weight_decay_layer_name in name
+                    for no_weight_decay_layer_name in
+                    no_weight_decay_layer_name_list)):
+                adamw_nowd_param_list.append(param)
+                adamw_nowd_param_names.append(name)
             else:
                 adamw_param_list.append(param)
                 adamw_param_names.append(name)
@@ -681,6 +752,13 @@ def build_optimizer(config, model):
                 'lr': lr,
                 'weight_decay': weight_decay,
             })
+        if len(adamw_nowd_param_names) > 0:
+            model_layer_weight_decay_list.append({
+                'name': adamw_nowd_param_names,
+                'optimizer': 'MuonAdamW(AdamW)',
+                'lr': lr,
+                'weight_decay': 0.,
+            })
 
         momentum = 0.95 if 'momentum' not in optimizer_parameters.keys(
         ) else optimizer_parameters['momentum']
@@ -700,6 +778,7 @@ def build_optimizer(config, model):
                          wd=weight_decay,
                          muon_params=muon_param_list,
                          adamw_params=adamw_param_list,
+                         adamw_nowd_params=adamw_nowd_param_list,
                          momentum=momentum,
                          nesterov=nesterov,
                          ns_steps=ns_steps,

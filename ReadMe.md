@@ -38,7 +38,7 @@ conda create -n SimpleGeneration python=3.12
 
 **4、Install PyTorch:**
 ```
-conda install pytorch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 pytorch-cuda=12.4 -c pytorch -c nvidia
+pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 To install a different PyTorch version, find command from here:
 
@@ -65,9 +65,22 @@ https://github.com/FoundationVision/LlamaGen
 https://github.com/duchenzhuang/FSQ-pytorch
 https://github.com/CompVis/taming-transformers
 https://github.com/CompVis/latent-diffusion
+https://github.com/bytedance-seed/BAGEL
+https://github.com/boogu-project/Boogu-Image
+https://github.com/ByteVisionLab/DreamLite
+https://github.com/baidu/ERNIE-Image
+https://github.com/FireRedTeam/FireRed-Image-Edit
+https://github.com/CostaliyA/Flow-OPD
 https://github.com/black-forest-labs/flux
 https://github.com/black-forest-labs/flux2
-https://github.com/baidu/ERNIE-Image
+https://github.com/zlab-princeton/i1
+https://github.com/ideogram-oss/ideogram4
+https://github.com/jd-opensource/JoyAI-Image
+https://github.com/krea-ai/krea-2
+https://github.com/bytedance/Lance
+https://github.com/microsoft/Mage
+https://github.com/Hope7Happiness/minit2i-torch
+https://github.com/jmliu206/SeFi-Image
 https://github.com/Tongyi-MAI/Z-Image
 ```
 

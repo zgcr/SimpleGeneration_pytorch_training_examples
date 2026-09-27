@@ -80,6 +80,7 @@ class config:
         {
             'lr': 1e-4,
             'weight_decay': 0,
+            'global_weight_decay': False,
             'exclude_muon_layer_name_list': [],
         },
     )
@@ -97,6 +98,7 @@ class config:
         {
             'lr': 1e-4,
             'weight_decay': 0,
+            'global_weight_decay': False,
             'exclude_muon_layer_name_list': [],
         },
     )

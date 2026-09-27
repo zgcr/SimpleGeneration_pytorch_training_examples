@@ -12,5 +12,7 @@ log
 *.log
 *.csv
 *.pyc
+*.otf
+*analysis_record
 .ipynb_checkpoints
 .gradio
