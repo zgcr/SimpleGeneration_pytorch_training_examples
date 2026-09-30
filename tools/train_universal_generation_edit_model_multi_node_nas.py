@@ -49,8 +49,6 @@ def main():
     config.gpus_type = torch.cuda.get_device_name()
     config.gpus_num = torch.cuda.device_count()
 
-    set_seed(config.seed)
-
     local_rank = int(os.environ['LOCAL_RANK'])
     config.local_rank = local_rank
     # start init process
@@ -60,6 +58,8 @@ def main():
     # 获取total_rank
     total_rank = torch.distributed.get_rank()
     config.total_rank = total_rank
+
+    set_seed(config.seed + total_rank)
 
     # 假设每个进程只使用一个GPU
     # 获取当前node上进程数量

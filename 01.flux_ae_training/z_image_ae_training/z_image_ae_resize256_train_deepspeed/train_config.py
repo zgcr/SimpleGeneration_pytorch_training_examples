@@ -78,7 +78,7 @@ class config:
     generator_optimizer = (
         'Muon',
         {
-            'lr': 1e-4,
+            'lr': 1e-3,
             'weight_decay': 0,
             'exclude_muon_layer_name_list': [],
         },
@@ -93,7 +93,7 @@ class config:
     )
 
     # The discriminator model is always fixed at ZeRO stage 0
-    # (DISCRIMINATOR_ZERO_STAGE), and deepspeed==0.19.3 does not implement Muon
+    # (DISCRIMINATOR_ZERO_STAGE), and deepspeed==0.19.7 does not implement Muon
     # for ZeRO stage 0, so the discriminator model can't use Muon optimizer.
     discriminator_optimizer = (
         'AdamW',

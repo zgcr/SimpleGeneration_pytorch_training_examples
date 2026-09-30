@@ -51,24 +51,11 @@ def rope(pos, dim, theta):
 
 
 def apply_rope(xq, xk, freqs_cis):
-    freqs_cis = torch.view_as_real(freqs_cis)
-    cos, sin = freqs_cis[..., 0], freqs_cis[..., 1]
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
 
-    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 2)
-    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 2)
-    xq_out = torch.stack([
-        cos * xq_[..., 0] +
-        (-sin) * xq_[..., 1], sin * xq_[..., 0] + cos * xq_[..., 1]
-    ],
-                         dim=-1)
-    xk_out = torch.stack([
-        cos * xk_[..., 0] +
-        (-sin) * xk_[..., 1], sin * xk_[..., 0] + cos * xk_[..., 1]
-    ],
-                         dim=-1)
-
-    xq_out = xq_out.flatten(-2).type_as(xq)
-    xk_out = xk_out.flatten(-2).type_as(xk)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2).type_as(xq)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(-2).type_as(xk)
 
     return xq_out, xk_out
 
@@ -256,11 +243,13 @@ def attention_packed(q, k, v, pe, attn_args, num_heads, num_kv_heads):
     # [total, Hq*D]
     out = out.transpose(1, 2).values().reshape(-1, Hq * D).to(compute_dtype)
 
-    # scatter back to the padded layout (padded rows stay zero). index_copy is
+    # scatter back to the padded layout (padded rows stay zero). index_copy_ is
     # the int-index counterpart of `x[valid_mask] = out` and writes exactly the
     # same rows, but its backward is a plain index_select (no nonzero / sync).
+    # In place, since `x` was just allocated here and is aliased by nobody, so
+    # the out-of-place form would only add a second full-size buffer.
     x = q.new_zeros(B * L, Hq * D)
-    x = x.index_copy(0, flat_index, out)
+    x.index_copy_(0, flat_index, out)
     x = x.view(B, L, Hq * D)
 
     return x
@@ -407,8 +396,10 @@ def attention_varlen(q, k, v, pe, attn_args):
     # scatter back to the padded layout (padded rows stay zero). index_copy_ is
     # the int-index counterpart of `x[valid_mask] = out` and writes exactly the
     # same rows, but its backward is a plain index_select (no nonzero / sync).
+    # In place, since `x` was just allocated here and is aliased by nobody, so
+    # the out-of-place form would only add a second full-size buffer.
     x = q.new_zeros(B * L, Hq * D, dtype=compute_dtype)
-    x = x.index_copy(0, flat_index, out)
+    x.index_copy_(0, flat_index, out)
     x = x.view(B, L, Hq * D)
 
     return x
@@ -1264,21 +1255,45 @@ class MixStreamMMDiT(nn.Module):
                                  self.attention_backend) if has_ref else None
 
         # ---- input-side refiners ----
+        # Checkpointed on the same switch as the main stack below: a
+        # RefinerBlock is as wide as a main block, so keeping the whole
+        # [B, L, hidden_size] activation trail of all three stacks alive was
+        # costing more than the recompute. Every op inside is deterministic
+        # (RMSNorm / Linear / QKNorm / attention at dropout_p=0.0), so the
+        # recomputed activations are bit-identical to the ones dropped here.
         # noise refiner: all noise tokens valid -> dense (no-mask) attention.
         for layer in self.noise_refiner:
-            noise_img = layer(noise_img,
-                              vec,
-                              pe_noise,
-                              noise_args,
-                              attention_backend=self.attention_backend)
+            if self.use_gradient_checkpoint:
+                noise_img = checkpoint(layer,
+                                       noise_img,
+                                       vec,
+                                       pe_noise,
+                                       noise_args,
+                                       self.attention_backend,
+                                       use_reentrant=False)
+            else:
+                noise_img = layer(noise_img,
+                                  vec,
+                                  pe_noise,
+                                  noise_args,
+                                  attention_backend=self.attention_backend)
 
         # context refiner: modulation=False, mask out padded text keys.
         for layer in self.context_refiner:
-            txt = layer(txt,
-                        None,
-                        pe_txt,
-                        ctx_args,
-                        attention_backend=self.attention_backend)
+            if self.use_gradient_checkpoint:
+                txt = checkpoint(layer,
+                                 txt,
+                                 None,
+                                 pe_txt,
+                                 ctx_args,
+                                 self.attention_backend,
+                                 use_reentrant=False)
+            else:
+                txt = layer(txt,
+                            None,
+                            pe_txt,
+                            ctx_args,
+                            attention_backend=self.attention_backend)
 
         if has_ref:
             pe_ref = self.pe_embedder(ref_ids)
@@ -1288,11 +1303,20 @@ class MixStreamMMDiT(nn.Module):
             # backbone assume the SAME timestep condition for reference tokens
             # (avoids a refiner/backbone modulation mismatch that would hurt reference fidelity / convergence).
             for layer in self.ref_image_refiner:
-                ref_img = layer(ref_img,
-                                vec_zero,
-                                pe_ref,
-                                ref_args,
-                                attention_backend=self.attention_backend)
+                if self.use_gradient_checkpoint:
+                    ref_img = checkpoint(layer,
+                                         ref_img,
+                                         vec_zero,
+                                         pe_ref,
+                                         ref_args,
+                                         self.attention_backend,
+                                         use_reentrant=False)
+                else:
+                    ref_img = layer(ref_img,
+                                    vec_zero,
+                                    pe_ref,
+                                    ref_args,
+                                    attention_backend=self.attention_backend)
 
         # ---- assemble image stream and joint sequence ----
         if has_ref:

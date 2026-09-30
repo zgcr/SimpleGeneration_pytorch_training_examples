@@ -70,7 +70,7 @@ class config:
     optimizer = (
         'Muon',
         {
-            'lr': 1e-4,
+            'lr': 1e-3,
             'weight_decay': 0,
             'exclude_muon_layer_name_list': [],
         },

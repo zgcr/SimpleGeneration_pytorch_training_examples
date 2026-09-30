@@ -18,11 +18,11 @@ from SimpleGeneration.flux_autoencoder.models.flux2_autoencoder import AutoEncod
 from SimpleGeneration.universal_generation_edit import models
 
 __all__ = [
-    'QWEN3VLUniversalGenerationEditModel',
+    'QWEN3VLUniversalGenerationEditModelFSDP',
 ]
 
 
-class QWEN3VLUniversalGenerationEditModel(nn.Module):
+class QWEN3VLUniversalGenerationEditModelFSDP(nn.Module):
 
     def __init__(self,
                  denoise_model_type='DoubleStreamMMDiT_1B',
@@ -39,9 +39,28 @@ class QWEN3VLUniversalGenerationEditModel(nn.Module):
                  use_gradient_checkpoint=False,
                  attention_backend='sdpa'):
         """
-        Training-only universal generation / edit model. The matching
-        inference-only model lives in
-        `qwen3vl_universal_generation_edit_model_test.py`.
+        FSDP2-only universal generation / edit model. The DDP/DeepSpeed variant
+        lives in `qwen3vl_universal_generation_edit_model_train.py` and the
+        inference-only model in `qwen3vl_universal_generation_edit_model_test.py`.
+
+        The ONLY structural difference from the DDP variant is the parameter
+        dtype layout, and it exists because FSDP2 shards per parameter:
+        `_FSDPParamGroup._init_mp_dtypes` asserts that every parameter inside
+        one sharded group carries the same original dtype, so the DDP variant's
+        mixed layout (bf16 frozen VLM base weights next to fp32 LoRA adapters
+        inside the very same decoder layer) cannot be sharded at all.
+
+        Here the WHOLE VLM is loaded in float32 and nothing is cast afterwards,
+        so the VLM and the denoise DiT are uniformly float32 and both can be
+        sharded. Dropping to `torch.bfloat16` for the actual matmuls is
+        then the job of FSDP2's `MixedPrecisionPolicy`: it all-gathers the
+        shards as that dtype, keeps the float32 master weights for the
+        optimizer update, and reduces gradients in float32. 
+
+        The float32 master weight the optimizer needs is no longer something
+        this model has to arrange by hand; FSDP2 holds it by construction.
+
+        The AE is the one module left out of the sharding.
 
         Args:
             denoise_model_type: registry name of the denoise DiT factory, e.g.
@@ -83,7 +102,7 @@ class QWEN3VLUniversalGenerationEditModel(nn.Module):
             use_gradient_checkpoint: gradient checkpointing for the VLM + DiT.
             attention_backend: 'sdpa' or 'flash_varlen' for the denoise DiT.
         """
-        super(QWEN3VLUniversalGenerationEditModel, self).__init__()
+        super(QWEN3VLUniversalGenerationEditModelFSDP, self).__init__()
 
         assert vlm_model_path is not None, "vlm_model_path must be provided for the VLM text/image encoder"
 
@@ -110,7 +129,7 @@ class QWEN3VLUniversalGenerationEditModel(nn.Module):
         self.vlm_dtype = torch.bfloat16
         self.vlm = Qwen3VLForConditionalGeneration.from_pretrained(
             vlm_model_path,
-            dtype=self.vlm_dtype,
+            dtype=torch.float32,
             attn_implementation='flash_attention_2')
         vlm_hidden_size = self.vlm.config.text_config.hidden_size
 
@@ -154,27 +173,6 @@ class QWEN3VLUniversalGenerationEditModel(nn.Module):
         visual.requires_grad_(False)
         visual.merger.requires_grad_(True)
         visual.deepstack_merger_list.requires_grad_(True)
-
-        # The frozen VLM weights stay bf16, every trainable tensor is promoted
-        # to fp32: bf16 has only an 8-bit mantissa, so at the usual lr an
-        # in-place optimizer update would round straight back to the old
-        # value. The LoRA adapters are already fp32 (`get_peft_model`); the
-        # two merger modules are not, having been unfrozen out of the bf16
-        # checkpoint.
-        for param in self.vlm.parameters():
-            if param.requires_grad:
-                param.data = param.data.float()
-
-        # The mergers now hold fp32 weights while the vision tower feeding
-        # them stays bf16, so their input has to be cast. The LoRA adapters
-        # need no such hook: peft casts their input to the adapter dtype
-        # inside `lora.Linear.forward`. `Qwen3VLVisionPatchMerger.forward`
-        # takes exactly one tensor argument.
-        cast_merger_input_to_fp32 = lambda module, args: (args[0].float(), )
-        visual.merger.register_forward_pre_hook(cast_merger_input_to_fp32)
-        for per_deepstack_merger in visual.deepstack_merger_list:
-            per_deepstack_merger.register_forward_pre_hook(
-                cast_merger_input_to_fp32)
 
         context_in_dim = len(self.deepstack_layers) * vlm_hidden_size
         self.context_in_dim = context_in_dim
@@ -278,14 +276,12 @@ class QWEN3VLUniversalGenerationEditModel(nn.Module):
         # projection and its activation memory are avoided. LoRA adapters stay
         # active and native DeepStack is still handled inside the forward.
         #
-        # The autocast is opted out of unconditionally, under all three amp
-        # modes (fp32 / bf16 / fp16). The frozen VLM weights are bf16, so they
-        # always compute in bf16; the trainable LoRA adapters and merger
-        # modules are fp32, so they always compute in fp32, which an in-place
-        # optimizer update at the usual lr needs (bf16 has only an 8-bit
-        # mantissa and would round straight back to the old value). Keeping it
-        # off also stops this nested region from overriding the caller's amp
-        # mode.
+        # The autocast is opted out of unconditionally. Precision here is
+        # decided entirely by FSDP2's `MixedPrecisionPolicy`, which gathers
+        # every VLM shard as `torch.bfloat16`, so an autocast on top would
+        # only add a second, redundant casting rule -- and leaving it on would
+        # let the caller's amp mode silently override the policy the whole
+        # model was sharded with.
         device_type = input_ids.device.type
         with torch.autocast(device_type=device_type, enabled=False):
             outputs = self.vlm.base_model.model.model(**vlm_kwargs)
@@ -421,7 +417,7 @@ class QWEN3VLUniversalGenerationEditModel(nn.Module):
             2], target_image.shape[3]
         assert target_height % 16 == 0 and target_width % 16 == 0
 
-        img_in_dtype = self.denoise_model.img_in.weight.dtype
+        img_in_dtype = torch.bfloat16
 
         # ---- condition feature from the VLM ----
         ctx, ctx_ids, ctx_mask = self.encode_condition(
@@ -432,9 +428,7 @@ class QWEN3VLUniversalGenerationEditModel(nn.Module):
             image_grid_thw=image_grid_thw,
             mm_token_type_ids=mm_token_type_ids)
         # `ctx` is a feature value feeding the DiT's txt_in nn.Linear, so it is
-        # aligned to the DiT's runtime weight dtype. The VLM always emits bf16,
-        # so without this cast an fp32 DiT would hit a dtype mismatch on the
-        # paths that run outside an outer autocast.
+        # aligned to the DiT's runtime dtype.
         ctx = ctx.to(img_in_dtype)
         # `ctx_ids` is a position index feeding only rope(), so it is pinned to
         # float32 unconditionally: bf16 is integer-exact only up to 256, above
@@ -602,266 +596,3 @@ class QWEN3VLUniversalGenerationEditModel(nn.Module):
                                         ref_index=ref_index)
 
         return model_pred, target
-
-
-if __name__ == '__main__':
-    import os
-    import random
-    import numpy as np
-    import torch
-    seed = 0
-    # for hash
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    # for python and numpy
-    random.seed(seed)
-    np.random.seed(seed)
-    # for cpu gpu
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    from PIL import Image
-    from tokenizer import Qwen3VLGenerationTokenizer
-
-    ################################################################################################################
-    ################################################################################################################
-    ################################################################################################################
-    # flux2 AE geometry (SimpleGeneration/flux_autoencoder/models/flux2_autoencoder.py):
-    #   encoder conv downsample 8x  (planes_mult=[1, 2, 4, 4] -> 2^3 stages)
-    #   x 2x2 patchify inside encode()
-    #   = 16x total, and z_planes(32) * 2 * 2 = 128 latent channels.
-    batch_size = 1
-    ae_z_planes = 32
-    ae_patch_size = 2
-    ae_conv_downsample_ratio = 8
-    ae_downsample_ratio = ae_conv_downsample_ratio * ae_patch_size
-    in_channels = ae_z_planes * ae_patch_size * ae_patch_size
-    # reference image j gets the temporal RoPE coordinate scale * (j + 1)
-    ref_time_coord_scale = 10
-    max_ref_images = 5
-    # LM layer taps concatenated into ctx; context_in_dim follows from them.
-    deepstack_layers = (9, 18, 36)
-
-    qwen3vl_model_path = "Qwen/Qwen3-VL-4B-Instruct"
-    gen_tokenizer = Qwen3VLGenerationTokenizer(qwen3vl_model_path)
-
-    print(f"batch_size: {batch_size}")
-    print(f"ae_z_planes: {ae_z_planes}")
-    print(f"ae_patch_size: {ae_patch_size}")
-    print(f"ae_conv_downsample_ratio: {ae_conv_downsample_ratio}")
-    print(f"ae_downsample_ratio: {ae_downsample_ratio}")
-    print(f"in_channels: {in_channels}")
-    print(f"ref_time_coord_scale: {ref_time_coord_scale}")
-    print(f"max_ref_images: {max_ref_images}")
-    print(f"deepstack_layers: {deepstack_layers}")
-
-    model = QWEN3VLUniversalGenerationEditModel(
-        denoise_model_type='DoubleStreamMMDiT_1B',
-        vlm_model_path=qwen3vl_model_path,
-        deepstack_layers=deepstack_layers,
-        in_channels=in_channels,
-        max_ref_images=max_ref_images,
-        ref_time_coord_scale=ref_time_coord_scale,
-        cfg_dropout_prob=0.1,
-        use_gradient_checkpoint=False,
-        attention_backend='sdpa')
-    model = model.cuda()
-
-    print(f"context_in_dim: {model.context_in_dim}")
-    print(f"out_channels: {model.out_channels}")
-    ################################################################################################################
-    ################################################################################################################
-    ################################################################################################################
-
-    # The frozen AE / frozen VLM base weights stay bf16 while every trainable
-    # tensor (denoise DiT, LoRA adapters, the two merger modules) is float32.
-    parameter_dtype_dict = {}
-    for per_parameter_name, per_parameter in model.named_parameters():
-        if per_parameter_name.startswith('ae.'):
-            per_group_name = 'ae'
-        elif per_parameter_name.startswith('denoise_model.'):
-            per_group_name = 'denoise_model'
-        elif 'lora_' in per_parameter_name:
-            per_group_name = 'vlm_lora'
-        elif 'merger' in per_parameter_name:
-            per_group_name = 'vlm_merger'
-        else:
-            per_group_name = 'vlm_frozen'
-        per_group_key = (per_group_name, str(per_parameter.dtype),
-                         per_parameter.requires_grad)
-        parameter_dtype_dict[per_group_key] = parameter_dtype_dict.get(
-            per_group_key, 0) + per_parameter.numel()
-
-    for per_group_key in sorted(parameter_dtype_dict, key=str):
-        print(f"group: {per_group_key[0]}, dtype: {per_group_key[1]}, "
-              f"requires_grad: {per_group_key[2]}, "
-              f"parameter_nums: {parameter_dtype_dict[per_group_key]}")
-
-    input_resolution_list = [[256, 256], [512, 512]]
-    input_reference_image_flag_list = [False, True]
-    input_amp_type_list = [None, torch.bfloat16, torch.float16]
-    for image_height, image_width in input_resolution_list:
-        for use_reference_image in input_reference_image_flag_list:
-            task_name = 'TI2I' if use_reference_image else 'T2I'
-            print(
-                f"{task_name}, image_height: {image_height}, image_width: {image_width}"
-            )
-
-            # ---- image resolution -> AE latent grid -> noise-target tokens ----
-            assert image_height % ae_downsample_ratio == 0
-            assert image_width % ae_downsample_ratio == 0
-            latent_height = image_height // ae_downsample_ratio
-            latent_width = image_width // ae_downsample_ratio
-            img_seq_len = latent_height * latent_width
-            print(
-                f"{task_name}, latent_height: {latent_height}, latent_width: {latent_width}, img_seq_len: {img_seq_len}"
-            )
-
-            # ---- prompt / reference image -> VLM condition input ----
-            # T2I feeds no image to the VLM, so pixel_values / image_grid_thw /
-            # mm_token_type_ids come back as None and must stay None.
-            if use_reference_image:
-                prompt_texts = ["change the background to a city street"]
-                pil_images_list = [[
-                    Image.fromarray(
-                        np.uint8(
-                            np.random.rand(image_height, image_width, 3) *
-                            255))
-                ] for _ in range(batch_size)]
-            else:
-                prompt_texts = [
-                    "a photo of a black-and-white Chinese rural dog"
-                ]
-                pil_images_list = None
-
-            tokenized = gen_tokenizer.encode(prompt_texts=prompt_texts,
-                                             sample_type=task_name,
-                                             pil_images_list=pil_images_list)
-
-            input_ids = tokenized['input_ids'].cuda()
-            attention_mask = tokenized['attention_mask'].cuda()
-            prompt_start_idx = tokenized['prompt_start_idx'].cuda()
-            print(f"{task_name}, input_ids shape: {tuple(input_ids.shape)}")
-            print(
-                f"{task_name}, attention_mask shape: {tuple(attention_mask.shape)}"
-            )
-            print(
-                f"{task_name}, prompt_start_idx: {prompt_start_idx.tolist()}")
-
-            pixel_values, image_grid_thw, mm_token_type_ids = None, None, None
-            if use_reference_image:
-                pixel_values = tokenized['pixel_values'].cuda()
-                image_grid_thw = tokenized['image_grid_thw'].cuda()
-                mm_token_type_ids = tokenized['mm_token_type_ids'].cuda()
-                print(
-                    f"{task_name}, pixel_values shape: {tuple(pixel_values.shape)}"
-                )
-                print(
-                    f"{task_name}, image_grid_thw: {image_grid_thw.tolist()}")
-                print(
-                    f"{task_name}, mm_token_type_ids shape: {tuple(mm_token_type_ids.shape)}"
-                )
-
-            # ---- AE-side inputs: target image and reference images ----
-            target_image = torch.randn(batch_size, 3, image_height,
-                                       image_width).cuda()
-            timesteps = torch.rand(batch_size).cuda()
-            print(
-                f"{task_name}, target_image shape: {tuple(target_image.shape)}"
-            )
-            print(f"{task_name}, timesteps shape: {tuple(timesteps.shape)}")
-
-            # reference_images is a list (len batch_size) of per-sample lists,
-            # since each sample may carry a different number of reference
-            # images and each one keeps its own resolution.
-            if use_reference_image:
-                # One reference image at the same resolution as the target.
-                reference_image_height, reference_image_width = image_height, image_width
-                ref_latent_height = reference_image_height // ae_downsample_ratio
-                ref_latent_width = reference_image_width // ae_downsample_ratio
-                ref_seq_len = ref_latent_height * ref_latent_width
-                reference_images = [[
-                    torch.randn(3, reference_image_height,
-                                reference_image_width).cuda()
-                ] for _ in range(batch_size)]
-                print(
-                    f"{task_name}, ref_latent_height: {ref_latent_height}, ref_latent_width: {ref_latent_width}"
-                )
-                print(f"{task_name}, ref_seq_len: {ref_seq_len}")
-            else:
-                reference_images = None
-
-            for amp_type in input_amp_type_list:
-                # amp_type None is the pure float32 path: the autocast is opened
-                # with enabled=False so that all three modes go through the same
-                # code and only the precision differs.
-                if amp_type is None:
-                    amp_context = torch.autocast(device_type='cuda',
-                                                 enabled=False)
-                else:
-                    amp_context = torch.autocast(device_type='cuda',
-                                                 dtype=amp_type)
-
-                # ---- training path: flow-matching forward + backward ----
-                # The AE is kept frozen by `requires_grad_(False)` plus the
-                # `bn.eval()` inside normalize / inv_normalize, so the train
-                # scripts' extra `model.ae.eval()` is not needed for
-                # correctness here.
-                model.train()
-                model.zero_grad(set_to_none=True)
-                with amp_context:
-                    model_pred, target = model(
-                        target_image=target_image,
-                        timesteps=timesteps,
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        prompt_start_idx=prompt_start_idx,
-                        pixel_values=pixel_values,
-                        image_grid_thw=image_grid_thw,
-                        mm_token_type_ids=mm_token_type_ids,
-                        reference_images=reference_images)
-                    loss = (model_pred.float() - target.float()).pow(2).mean()
-                loss.backward()
-
-                print(
-                    f"{task_name}, amp_type: {amp_type}, model_pred shape: {tuple(model_pred.shape)}, "
-                    f"model_pred dtype: {model_pred.dtype}, target dtype: {target.dtype}, "
-                    f"loss: {loss.item():.4f}")
-                assert model_pred.shape == (batch_size, img_seq_len,
-                                            in_channels)
-                assert model_pred.shape == target.shape
-                assert target.dtype == torch.float32
-                assert not torch.any(torch.isnan(loss))
-
-                # The AE never receives a gradient; every trainable VLM tensor
-                # and the whole denoise DiT do.
-                ae_grad_nums = len([
-                    per_parameter for per_parameter in model.ae.parameters()
-                    if per_parameter.grad is not None
-                ])
-                lora_grad_nums = len([
-                    per_parameter_name for per_parameter_name, per_parameter in
-                    model.named_parameters() if 'lora_' in per_parameter_name
-                    and per_parameter.grad is not None
-                ])
-                denoise_model_grad_nums = len([
-                    per_parameter_name for per_parameter_name, per_parameter in
-                    model.named_parameters()
-                    if per_parameter_name.startswith('denoise_model.')
-                    and per_parameter.grad is not None
-                ])
-                print(
-                    f"{task_name}, amp_type: {amp_type}, ae_grad_nums: {ae_grad_nums}, "
-                    f"lora_grad_nums: {lora_grad_nums}, denoise_model_grad_nums: {denoise_model_grad_nums}"
-                )
-                assert ae_grad_nums == 0
-                assert lora_grad_nums > 0
-                assert denoise_model_grad_nums > 0
-
-                torch.cuda.empty_cache()
-            ########################################################################################################
-            ########################################################################################################
-            ########################################################################################################
-
-    del model
-    torch.cuda.empty_cache()

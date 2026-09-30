@@ -27,6 +27,44 @@ from tools.utils import get_logger, set_seed, worker_seed_init_fn, DeepSpeedEmaM
 DISCRIMINATOR_ZERO_STAGE = 0
 
 
+def patch_deepspeed_muon_flags(exclude_muon_layer_name_list):
+    """Let `exclude_muon_layer_name_list` reach DeepSpeed's Muon tagging.
+
+    `deepspeed.initialize` tags every parameter through `set_optimizer_flags`
+    (deepspeed/__init__.py), which only ever excludes "embed" / "lm_head", and
+    it runs AFTER `build_param_groups`, so a `use_muon` written there is
+    overwritten before the engine ever reads it. That default tagging sends
+    every embedding-like parameter kept out by the pytorch launcher's
+    `exclude_muon_layer_name_list` to Muon, whose whole-matrix
+    orthogonalization is meaningless for them.
+
+    Wrapping the function keeps DeepSpeed's own rule and applies the extra
+    exclusions on top of it. It is also the only place where that stays
+    correct: the flag has two consumers, the optimizer's param group
+    (engine._muon_param_groups) and the orthogonalization test in
+    stage_1_and_2.get_flat_partition, and re-tagging after initialize() would
+    leave the two disagreeing, which silently turns those parameters into
+    plain SGD.
+    """
+    original_set_optimizer_flags = deepspeed.set_optimizer_flags
+
+    @functools.wraps(original_set_optimizer_flags)
+    def set_optimizer_flags_with_exclusions(config_class, model):
+        original_set_optimizer_flags(config_class, model)
+
+        # DeepSpeedConfig lowercases the optimizer name, and the tagging only
+        # happens for Muon at all.
+        if config_class.optimizer_name != 'muon':
+            return
+
+        for name, param in model.named_parameters():
+            if any(exclude_name in name.lower()
+                   for exclude_name in exclude_muon_layer_name_list):
+                param.use_muon = False
+
+    deepspeed.set_optimizer_flags = set_optimizer_flags_with_exclusions
+
+
 def build_param_groups(config, model, model_type):
     """Build parameter groups for DeepSpeed optimizer.
     For AdamW: differentiate weight decay (1D params and specified layers get 0).
@@ -49,11 +87,33 @@ def build_param_groups(config, model, model_type):
     lr = optimizer_parameters['lr']
     weight_decay = optimizer_parameters['weight_decay']
 
-    # For Muon, DeepSpeed 0.19.3 native implementation requires each
-    # parameter to have a `use_muon` attribute (True/False) so that
-    # the engine can split params into Muon group (ndim>=2) and
-    # AdamW fallback group (ndim<2).
+    # For Muon, the DeepSpeed 0.19.7 native implementation requires each parameter to
+    # have a `use_muon` attribute (True/False) so that the engine can split
+    # params into a Muon group (ndim>=2) and an AdamW fallback group (ndim<2).
     if optimizer_name == 'Muon':
+        # Muon orthogonalizes whole 2D weight matrices, which is meaningless
+        # for embedding-like parameters, so those fall back to AdamW. Same
+        # list the pytorch launcher's MuonAdamW consumes, so both launchers
+        # optimize the same parameter with the same algorithm.
+        exclude_muon_layer_name_list = [
+            'position_encoding',
+            'cls_token',
+            'patch_embedding',
+            'embed',
+            'lm_head',
+            'merger',
+        ]
+        if 'exclude_muon_layer_name_list' in optimizer_parameters.keys(
+        ) and isinstance(optimizer_parameters['exclude_muon_layer_name_list'],
+                         list):
+            exclude_muon_layer_name_list = exclude_muon_layer_name_list + optimizer_parameters[
+                'exclude_muon_layer_name_list']
+
+        # `deepspeed.initialize` re-tags every parameter AFTER this function
+        # runs and would drop the exclusions, so they are pushed into that
+        # tagging instead of only being written below.
+        patch_deepspeed_muon_flags(exclude_muon_layer_name_list)
+
         muon_param_names = []
         adamw_param_names = []
         all_params = []
@@ -61,18 +121,17 @@ def build_param_groups(config, model, model_type):
             if not param.requires_grad:
                 continue
             all_params.append(param)
-            # DeepSpeed 0.19.3 engine.py requires `param.use_muon`
-            # attribute on every parameter. Must match the logic in
-            # deepspeed.set_optimizer_flags() (called inside
-            # deepspeed.initialize()) which excludes params whose name
-            # contains "embed" or "lm_head".
-            if param.ndim >= 2 and not any(
-                    keyword in name.lower()
-                    for keyword in ("embed", "lm_head")):
-                param.use_muon = True
+            # DeepSpeed 0.19.7 engine.py requires `param.use_muon` on every parameter. The
+            # name is lowercased before matching, exactly like
+            # deepspeed.set_optimizer_flags does.
+            use_muon = (
+                param.ndim >= 2
+                and not any(exclude_name in name.lower()
+                            for exclude_name in exclude_muon_layer_name_list))
+            param.use_muon = use_muon
+            if use_muon:
                 muon_param_names.append(name)
             else:
-                param.use_muon = False
                 adamw_param_names.append(name)
 
         model_params_weight_decay_list = all_params
@@ -276,7 +335,7 @@ def build_deepspeed_config(config, model_type):
     # under ZeRO stage 1/2/3).
     assert optimizer_name in ['SGD', 'AdamW', 'Muon'], 'Unsupported optimizer!'
 
-    # For deepspeed==0.19.3, Muon optimizer requires reduce_scatter=False for ZeRO stage 1/2/3.
+    # For deepspeed==0.19.7, Muon optimizer requires reduce_scatter=False for ZeRO stage 1/2/3.
     # Muon's Newton-Schulz orthogonalization is a whole-matrix operation that needs the full
     # reduced gradient. With reduce_scatter=True (default), each rank only receives its own
     # partition slice after reduce-scatter, causing cross-partition parameters to get incorrect
@@ -287,7 +346,7 @@ def build_deepspeed_config(config, model_type):
     if optimizer_name == 'Muon' and zero_stage in [1, 2, 3]:
         ds_config["zero_optimization"]["reduce_scatter"] = False
 
-    # For deepspeed==0.19.3, ZeRO stage 0 does NOT implement Muon at all.
+    # For deepspeed==0.19.7, ZeRO stage 0 does NOT implement Muon at all.
     # Traced through the source:
     #   1. engine._configure_basic_optimizer() (runtime/engine.py:2072) builds a
     #      MuonWithAuxAdam with a use_muon=True group (ndim>=2, name free of
@@ -320,7 +379,7 @@ def build_deepspeed_config(config, model_type):
     # Note the discriminator model is always fixed at ZeRO stage 0
     # (DISCRIMINATOR_ZERO_STAGE), so its optimizer must not be Muon.
     assert not (optimizer_name == 'Muon' and zero_stage == 0), \
-        'Muon is not implemented for ZeRO stage 0 in deepspeed 0.19.3 (see comment above). ' \
+        'Muon is not implemented for ZeRO stage 0 in deepspeed 0.19.7 (see comment above). ' \
         'Use deepspeed_zero_stage in [1, 2, 3], or switch to the pytorch launcher with MuonAdamW.'
 
     if optimizer_name == 'SGD':
@@ -350,7 +409,7 @@ def build_deepspeed_config(config, model_type):
             }
         }
     elif optimizer_name == 'Muon':
-        # DeepSpeed 0.19.3 engine.py _configure_basic_optimizer() only
+        # DeepSpeed 0.19.7 engine.py _configure_basic_optimizer() only
         # recognizes these keys for Muon param groups:
         #   muon group:  ["lr", "momentum", "weight_decay", "muon_lr", "ns_method"]
         #   adamw group: ["lr", "betas", "eps", "weight_decay", "adam_lr"]
@@ -832,7 +891,7 @@ def main():
 
     start_epoch, train_time = 1, 0
     best_loss, train_loss = 1e9, 0
-    # Resume from DeepSpeed checkpoint (generator uses tag="generator", discriminator uses tag="discriminator")
+    # Resume from DeepSpeed checkpoint (tag="" saves directly in each model's checkpoint_dir)
     if os.path.exists(resume_generator_model) and os.path.exists(
             resume_discriminator_model):
         _, client_state = generator_model_engine.load_checkpoint(

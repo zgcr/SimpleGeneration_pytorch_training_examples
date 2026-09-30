@@ -98,7 +98,9 @@ class QWEN3VLUniversalGenerationEditModelTest(nn.Module):
         # tree, so the topology has to match it exactly.
         self.vlm_dtype = torch.bfloat16
         self.vlm = Qwen3VLForConditionalGeneration.from_pretrained(
-            vlm_model_path, torch_dtype=self.vlm_dtype)
+            vlm_model_path,
+            dtype=self.vlm_dtype,
+            attn_implementation='flash_attention_2')
         vlm_hidden_size = self.vlm.config.text_config.hidden_size
 
         # Only the LM layers up to the deepest deepstack layer contribute to

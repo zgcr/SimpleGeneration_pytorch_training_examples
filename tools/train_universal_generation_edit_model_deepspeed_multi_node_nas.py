@@ -27,6 +27,45 @@ from tools.universal_generation_edit_model_scripts import train_universal_genera
 from tools.utils import get_logger, set_seed, worker_seed_init_fn, Scheduler
 
 
+def patch_deepspeed_muon_flags(exclude_muon_layer_name_list):
+    """Let `exclude_muon_layer_name_list` reach DeepSpeed's Muon tagging.
+
+    `deepspeed.initialize` tags every parameter through `set_optimizer_flags`
+    (deepspeed/__init__.py), which only ever excludes "embed" / "lm_head", and
+    it runs AFTER `build_param_groups`, so a `use_muon` written there is
+    overwritten before the engine ever reads it. That default tagging sends the
+    LoRA adapters and the vision->LLM merger projections to Muon, whose
+    whole-matrix orthogonalization is wrong for a low-rank factor -- the
+    pytorch launcher excludes exactly those through
+    `exclude_muon_layer_name_list`.
+
+    Wrapping the function keeps DeepSpeed's own rule and applies the extra
+    exclusions on top of it. It is also the only place where that stays
+    correct: the flag has two consumers, the optimizer's param group
+    (engine._muon_param_groups) and the orthogonalization test in
+    stage_1_and_2.get_flat_partition, and re-tagging after initialize() would
+    leave the two disagreeing, which silently turns those parameters into
+    plain SGD.
+    """
+    original_set_optimizer_flags = deepspeed.set_optimizer_flags
+
+    @functools.wraps(original_set_optimizer_flags)
+    def set_optimizer_flags_with_exclusions(config_class, model):
+        original_set_optimizer_flags(config_class, model)
+
+        # DeepSpeedConfig lowercases the optimizer name, and the tagging only
+        # happens for Muon at all.
+        if config_class.optimizer_name != 'muon':
+            return
+
+        for name, param in model.named_parameters():
+            if any(exclude_name in name.lower()
+                   for exclude_name in exclude_muon_layer_name_list):
+                param.use_muon = False
+
+    deepspeed.set_optimizer_flags = set_optimizer_flags_with_exclusions
+
+
 def build_param_groups(config, model):
     """Build parameter groups for DeepSpeed optimizer.
     For AdamW: differentiate weight decay (1D params and specified layers get 0).
@@ -40,11 +79,34 @@ def build_param_groups(config, model):
     lr = optimizer_parameters['lr']
     weight_decay = optimizer_parameters['weight_decay']
 
-    # For Muon, DeepSpeed 0.19.3 native implementation requires each
-    # parameter to have a `use_muon` attribute (True/False) so that
-    # the engine can split params into Muon group (ndim>=2) and
-    # AdamW fallback group (ndim<2).
+    # For Muon, the DeepSpeed 0.19.7 native implementation requires each parameter to
+    # have a `use_muon` attribute (True/False) so that the engine can split
+    # params into a Muon group (ndim>=2) and an AdamW fallback group (ndim<2).
     if optimizer_name == 'Muon':
+        # Muon orthogonalizes whole 2D weight matrices, which is wrong for the
+        # LoRA adapters (low-rank factors) and for the vision->LLM merger
+        # projections, so those fall back to AdamW. Same list the pytorch
+        # launcher's MuonAdamW consumes, so both launchers optimize the same
+        # parameter with the same algorithm.
+        exclude_muon_layer_name_list = [
+            'position_encoding',
+            'cls_token',
+            'patch_embedding',
+            'embed',
+            'lm_head',
+            'merger',
+        ]
+        if 'exclude_muon_layer_name_list' in optimizer_parameters.keys(
+        ) and isinstance(optimizer_parameters['exclude_muon_layer_name_list'],
+                         list):
+            exclude_muon_layer_name_list = exclude_muon_layer_name_list + optimizer_parameters[
+                'exclude_muon_layer_name_list']
+
+        # `deepspeed.initialize` re-tags every parameter AFTER this function
+        # runs and would drop the exclusions, so they are pushed into that
+        # tagging instead of only being written below.
+        patch_deepspeed_muon_flags(exclude_muon_layer_name_list)
+
         muon_param_names = []
         adamw_param_names = []
         all_params = []
@@ -52,18 +114,17 @@ def build_param_groups(config, model):
             if not param.requires_grad:
                 continue
             all_params.append(param)
-            # DeepSpeed 0.19.3 engine.py requires `param.use_muon`
-            # attribute on every parameter. Must match the logic in
-            # deepspeed.set_optimizer_flags() (called inside
-            # deepspeed.initialize()) which excludes params whose name
-            # contains "embed" or "lm_head".
-            if param.ndim >= 2 and not any(
-                    keyword in name.lower()
-                    for keyword in ("embed", "lm_head")):
-                param.use_muon = True
+            # DeepSpeed 0.19.7 engine.py requires `param.use_muon` on every parameter. The
+            # name is lowercased before matching, exactly like
+            # deepspeed.set_optimizer_flags does.
+            use_muon = (
+                param.ndim >= 2
+                and not any(exclude_name in name.lower()
+                            for exclude_name in exclude_muon_layer_name_list))
+            param.use_muon = use_muon
+            if use_muon:
                 muon_param_names.append(name)
             else:
-                param.use_muon = False
                 adamw_param_names.append(name)
 
         model_params_weight_decay_list = all_params
@@ -247,7 +308,7 @@ def build_deepspeed_config(config):
     optimizer_parameters = config.optimizer[1]
     assert optimizer_name in ['SGD', 'AdamW', 'Muon'], 'Unsupported optimizer!'
 
-    # For deepspeed==0.19.3, Muon optimizer requires reduce_scatter=False for ZeRO stage 1/2/3.
+    # For deepspeed==0.19.7, Muon optimizer requires reduce_scatter=False for ZeRO stage 1/2/3.
     # Muon's Newton-Schulz orthogonalization is a whole-matrix operation that needs the full
     # reduced gradient. With reduce_scatter=True (default), each rank only receives its own
     # partition slice after reduce-scatter, causing cross-partition parameters to get incorrect
@@ -258,7 +319,7 @@ def build_deepspeed_config(config):
     if optimizer_name == 'Muon' and config.deepspeed_zero_stage in [1, 2, 3]:
         ds_config["zero_optimization"]["reduce_scatter"] = False
 
-    # For deepspeed==0.19.3, ZeRO stage 0 does NOT implement Muon at all.
+    # For deepspeed==0.19.7, ZeRO stage 0 does NOT implement Muon at all.
     # Traced through the source:
     #   1. engine._configure_basic_optimizer() (runtime/engine.py:2072) builds a
     #      MuonWithAuxAdam with a use_muon=True group (ndim>=2, name free of
@@ -290,7 +351,7 @@ def build_deepspeed_config(config):
     # stage 1/2/3 run. Fail loudly instead of silently training the wrong thing.
     assert not (optimizer_name == 'Muon'
                 and config.deepspeed_zero_stage == 0), \
-        'Muon is not implemented for ZeRO stage 0 in deepspeed 0.19.3 (see comment above). ' \
+        'Muon is not implemented for ZeRO stage 0 in deepspeed 0.19.7 (see comment above). ' \
         'Use deepspeed_zero_stage in [1, 2, 3], or switch to the pytorch launcher with MuonAdamW.'
 
     if optimizer_name == 'SGD':
@@ -320,7 +381,7 @@ def build_deepspeed_config(config):
             }
         }
     elif optimizer_name == 'Muon':
-        # DeepSpeed 0.19.3 engine.py _configure_basic_optimizer() only
+        # DeepSpeed 0.19.7 engine.py _configure_basic_optimizer() only
         # recognizes these keys for Muon param groups:
         #   muon group:  ["lr", "momentum", "weight_decay", "muon_lr", "ns_method"]
         #   adamw group: ["lr", "betas", "eps", "weight_decay", "adam_lr"]
@@ -472,8 +533,6 @@ def main():
         resume_model = os.path.join(checkpoint_dir,
                                     'mp_rank_00_model_states.pt')
 
-    set_seed(config.seed)
-
     local_rank = int(os.environ['LOCAL_RANK'])
     config.local_rank = local_rank
     # start init process
@@ -483,6 +542,8 @@ def main():
     # 获取total_rank
     total_rank = torch.distributed.get_rank()
     config.total_rank = total_rank
+
+    set_seed(config.seed + total_rank)
 
     config.gpus_num = torch.distributed.get_world_size()
 

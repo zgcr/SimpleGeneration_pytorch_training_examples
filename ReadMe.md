@@ -18,7 +18,7 @@
 
 # Environments
 
-**1、Python and Pytorch Supported Version: Python>=3.12, Pytorch>=2.5.1.**
+**1、Python and Pytorch Supported Version: Python>=3.12, Pytorch>=2.8.0.**
 
 **2、(optional)Add HF_HOME dir HF_ENDPOINT dir in .bashrc and .zshrc:**
 ```

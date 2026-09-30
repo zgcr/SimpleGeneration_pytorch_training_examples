@@ -362,12 +362,14 @@ def build_training_mode(config, model):
             ema_model.ema_model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=find_unused_parameters)
+            find_unused_parameters=find_unused_parameters,
+            gradient_as_bucket_view=True)
     model = nn.parallel.DistributedDataParallel(
         model,
         device_ids=[local_rank],
         output_device=local_rank,
-        find_unused_parameters=find_unused_parameters)
+        find_unused_parameters=find_unused_parameters,
+        gradient_as_bucket_view=True)
 
     if hasattr(config, 'use_amp') and config.use_amp:
         if config.amp_type == torch.bfloat16:

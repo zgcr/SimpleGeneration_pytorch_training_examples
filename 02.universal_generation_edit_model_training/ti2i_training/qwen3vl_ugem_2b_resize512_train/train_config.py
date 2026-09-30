@@ -21,7 +21,7 @@ import torchvision.transforms as transforms
 
 class config:
     network = 'qwen3vl_universal_generation_edit_model'
-    denoise_model_type = 'DoubleStreamMMDiT_1B'
+    denoise_model_type = 'SingleStreamMMDiT_2B'
     task_type = 'TI2I'
     base_resize = 512
 
@@ -30,14 +30,14 @@ class config:
 
     model = QWEN3VLUniversalGenerationEditModel(
         **{
-            'denoise_model_type': 'DoubleStreamMMDiT_1B',
+            'denoise_model_type': denoise_model_type,
             'vlm_model_path': vlm_model_path,
             'deepstack_layers': (9, 18, 36),
             'max_ref_images': 5,
             'ref_time_coord_scale': 20,
             'cfg_dropout_prob': 0.1,
             'use_gradient_checkpoint': True,
-            'attention_backend': 'sdpa',
+            'attention_backend': 'flash_varlen',
         })
 
     trained_ae_model_path = '/root/autodl-tmp/pretrained_models/flux2_convert_from_pytorch_official_weights/FLUX.2-dev-ae_convert_from_pytorch_official_weight.pth'
@@ -307,16 +307,26 @@ class config:
     seed = 0
 
     # batch_size is total size
-    batch_size = 8
+    batch_size = 4
     # num_workers is total workers
-    num_workers = 8
+    num_workers = 32
     accumulation_steps = 1
 
     optimizer = (
-        'Muon',
+        'MuonAdamW',
         {
             'lr': 1e-4,
             'weight_decay': 0,
+            'global_weight_decay': False,
+            # Muon orthogonalizes whole 2D weight matrices, which is wrong for
+            # the LoRA adapters (low-rank factors) and for the vision->LLM
+            # merger projections, so the VLM side falls back to AdamW. The AE
+            # is frozen and never reaches the optimizer at all.
+            'exclude_muon_layer_name_list': [
+                'vlm',
+                'lora',
+                'merger',
+            ],
         },
     )
 
@@ -348,9 +358,4 @@ class config:
         'mode': 'default',
     }
 
-    clip_max_norm = 1.0
-
-    # ZeRO stage: 0 (equivalent to DDP), 1, 2, 3
-    deepspeed_zero_stage = 2
-    # ZeRO-Offload: offload optimizer states (and params for stage 3) to CPU
-    deepspeed_offload = False
+    find_unused_parameters = True
